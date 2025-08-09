@@ -1,0 +1,452 @@
+// Program.cs
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Xml.Linq;
+using Npgsql;
+
+//class Program_
+//{
+//    static void Main()
+//    {
+//        // Configurações do seu MOS Gateway
+//        string mosServer = "172.16.2.31"; // IP do ENPS MOS Gateway
+//        int mosPort = 10540; // Porta padrão do MOS (confirme no seu ENPS)
+
+//        // Dados do roStorySend
+//        string roID = "SRV-013-ENPS01;P_VIDEOGRA\\W;BFAA1917";
+//        string storyID = "STORY123";
+//        string storySlug = "Minha Matéria";
+//        string storyBody = "Texto da minha matéria enviado pelo MOS.";
+
+//        // Monta o XML roStorySend
+//        XDocument roStorySend = new XDocument(
+//            new XElement("mos",
+//                new XElement("mosID", "VMIX.MOS"), // Seu MOS ID
+//                new XElement("ncsID", "SRV-013-ENPS01"), // ID do ENPS
+//                new XElement("roStorySend",
+//                    new XElement("roID", roID),
+//                    new XElement("storyID", storyID),
+//                    new XElement("storySlug", storySlug),
+//                    new XElement("storyBody",
+//                        new XElement("storyText", storyBody)
+//                    )
+//                )
+//            )
+//        );
+
+//        string xmlString = roStorySend.Declaration + roStorySend.ToString();
+
+//        // Conecta ao servidor MOS e envia
+//        try
+//        {
+//            using (TcpClient client = new TcpClient(mosServer, mosPort))
+//            using (NetworkStream stream = client.GetStream())
+//            {
+//                byte[] data = Encoding.UTF8.GetBytes(xmlString);
+//                stream.Write(data, 0, data.Length);
+//                Console.WriteLine("✅ roStorySend enviado com sucesso!");
+//            }
+//        }
+//        catch (Exception ex)
+//        {
+//            Console.WriteLine("❌ Erro ao enviar roStorySend: " + ex.Message);
+//        }
+//    }
+//}
+
+public class Models
+{
+    public class Log
+    {
+        public string Message { get; set; }
+    }
+}
+public class Dados
+{
+    private readonly string cnPG;
+    NpgsqlConnection conn;
+    public Dados()
+    {
+        cnPG = "Host=172.16.1.216;Username=videografia;Password=Jovemp@n;Search Path=Crawl;Database=VideografiaApps;";
+        //cnPG = "Host=127.0.0.1;Username=postgres;Password=postgres;Search Path=Crawl;Database=local;";
+        conn = new NpgsqlConnection(cnPG);
+        //conn.Open();
+    }
+
+    public async void Connect()
+    {
+        if (conn.State == System.Data.ConnectionState.Closed)
+            conn.Open();
+    }
+
+    public async void Disconnect()
+    {
+        if (conn.State == System.Data.ConnectionState.Open)
+            conn.Close();
+    }
+
+    //public async void addLog(Models.Crawl item)
+    public async void addLog(Models.Log item)
+    {
+        Connect();
+        //await using var cmd = new NpgsqlCommand("INSERT INTO \"MOS\".\"Logs\" (\"Message\", \"Tipo\", \"DataHora\", \"DataHoraAtualizacao\", \"Titulo\", \"Content\", \"Status\") VALUES ($1, $2, $3, $4, $5, $6, $7)", conn)
+        await using var cmd = new NpgsqlCommand("INSERT INTO \"MOS\".\"Logs\" (\"Message\") VALUES ($1)", conn)
+        {
+            Parameters = {
+                    new() { Value = item.Message },
+                    //new() { Value = item.Tipo },
+                    //new() { Value = item.DataHora },
+                    //new() { Value = item.DataHoraAtualizacao },
+                    //new() { Value = item.Titulo },
+                    //new() { Value = item.Content },
+                    //new() { Value = item.Status}
+                }
+        };
+        await cmd.ExecuteNonQueryAsync();
+        Disconnect();
+    }
+
+    //public Models.Crawl getLast(string Tipo)
+    //{
+    //    Connect();
+    //    using var cmd = new NpgsqlCommand("select \"Id\", \"Identificador\", \"Tipo\", \"Titulo\", \"DataHora\", \"DataHoraAtualizacao\", \"Status\", \"Content\" "
+    //        + "from \"Crawl\".\"Logs\" where \"Tipo\" = $1 order by \"Id\" Desc Limit 1", conn)
+    //    { Parameters = { new() { Value = Tipo } } };
+
+    //    using var reader = cmd.ExecuteReader();
+
+    //    Models.Crawl log = null;
+
+    //    if (reader != null)
+    //    {
+    //        log = new Models.Crawl();
+    //        while (reader.Read())
+    //        {
+    //            log.Id = reader.GetInt32(0);
+    //            log.Identificador = reader.GetInt32(1);
+    //            log.Tipo = reader.GetString(2);
+    //            log.Titulo = reader.GetString(3);
+    //            log.DataHora = reader.GetDateTime(4);
+    //            log.DataHoraAtualizacao = reader.GetDateTime(5);
+    //            log.Status = reader.GetString(6);
+    //            log.Content = reader.GetString(7);
+    //        }
+    //        Disconnect();
+    //        return log;
+    //    }
+
+    //    Disconnect();
+    //    return log;
+    //}
+}
+
+class Program
+{
+    static readonly int[] PORTS = { 10540, 10541 };
+    public static Dados dados = new Dados();
+
+    static async Task Main()
+    {
+        foreach (var p in PORTS) StartServer(p);
+        Console.WriteLine("Servidor MOS rodando...");
+        await Task.Delay(-1);
+    }
+
+    static void StartServer(int port)
+    {
+        var listener = new TcpListener(IPAddress.Any, port);
+        listener.Start();
+        Console.WriteLine($"Escutando na porta {port}");
+        _ = Task.Run(async () =>
+        {
+            while (true)
+            {
+                var client = await listener.AcceptTcpClientAsync();
+                _ = HandleClient(client, port);
+            }
+        });
+    }
+
+    static async Task HandleClient(TcpClient client, int port)
+    {
+        var endpoint = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
+        Console.WriteLine($"Conexão recebida de {endpoint} na porta {port}");
+
+        var stream = client.GetStream();
+        var bufferList = new List<byte>();
+        var readBuffer = new byte[4096];
+
+        try
+        {
+            while (true)
+            {
+                int n = await stream.ReadAsync(readBuffer, 0, readBuffer.Length);
+                if (n == 0) break; // conexão fechada
+
+                // Append bytes recebidos ao buffer
+                for (int i = 0; i < n; i++) bufferList.Add(readBuffer[i]);
+
+                // Tentar processar 1..N mensagens completas presentes no buffer
+                bool loop = true;
+                while (loop)
+                {
+                    loop = false;
+                    if (bufferList.Count < 2) break; // nada suficiente ainda
+
+                    // Detecta encoding com base no conteúdo atual do buffer
+                    var bytesArray = bufferList.ToArray();
+                    var encoding = DetectEncoding(bytesArray);
+
+                    // Se for UTF-16 (LE/BE), precisamos de número par de bytes para decodificar corretamente
+                    if ((encoding == Encoding.Unicode || encoding == Encoding.BigEndianUnicode) && (bufferList.Count % 2 != 0))
+                    {
+                        // aguarda mais bytes
+                        break;
+                    }
+
+                    // Offset para pular BOM caso exista (2 bytes)
+                    int bomOffset = 0;
+                    if (bytesArray.Length >= 2)
+                    {
+                        if (bytesArray[0] == 0xFF && bytesArray[1] == 0xFE) bomOffset = 2; // UTF-16LE BOM
+                        else if (bytesArray[0] == 0xFE && bytesArray[1] == 0xFF) bomOffset = 2; // UTF-16BE BOM
+                        else if (bytesArray.Length >= 3 && bytesArray[0] == 0xEF && bytesArray[1] == 0xBB && bytesArray[2] == 0xBF) bomOffset = 3; // UTF-8 BOM
+                    }
+
+                    // Trabalha com uma cópia "útil" sem o BOM inicial
+                    var usable = bytesArray.Skip(bomOffset).ToArray();
+                    string messageCandidate;
+                    try
+                    {
+                        messageCandidate = encoding.GetString(usable);
+                    }
+                    catch
+                    {
+                        // fallback para UTF-8 se houver problema
+                        messageCandidate = Encoding.UTF8.GetString(usable);
+                        encoding = Encoding.UTF8;
+                    }
+
+                    // Remove eventual BOM char Unicode (U+FEFF) e trim
+                    messageCandidate = messageCandidate.TrimStart('\uFEFF').Trim();
+                    messageCandidate = Regex.Replace(
+                        messageCandidate, @"^[\s\S]*?(<mos\b)", "$1", RegexOptions.IgnoreCase);
+
+                    // Procurar por fechamento de mensagem MOS
+                    int endIdx = messageCandidate.IndexOf("</mos>", StringComparison.Ordinal);
+                    if (endIdx == -1)
+                    {
+                        // Não há mensagem completa ainda → aguarda mais bytes
+                        break;
+                    }
+
+                    // Temos pelo menos uma mensagem completa
+                    int inclusive = endIdx + "</mos>".Length;
+                    
+                    
+                    string xmlString = messageCandidate.Substring(0, inclusive);
+
+
+
+                    // Parse e tratamento
+                    try
+                    {
+                        dados.addLog(new Models.Log() { Message = xmlString });
+
+                        var doc = XDocument.Parse(xmlString);
+                        //Console.WriteLine($"============================\n{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss ")}" + $"\n============================\nXML parseado:\n" + xmlString);
+                        Console.WriteLine($"============================\n{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss ")}" + $"\n============================");
+                        string roId = "";
+
+                        var roCreate = doc.Root.Element("roCreate");
+                        if (roCreate != null)
+                        {
+                            roId = roCreate.Element("roID")?.Value ?? "";
+                            Console.WriteLine("roCreate identificado: " + roId);
+                        }
+
+                        var roStorySend = doc.Root.Element("roStorySend");
+                        if (roStorySend != null)
+                        {
+                            roId = roStorySend.Element("roID")?.Value ?? "";
+                            var storyID = roStorySend.Element("storyID")?.Value ?? "";
+                            var storySlug = roStorySend.Element("storySlug")?.Value ?? "";
+                            Console.WriteLine("roStorySend identificado: " + roId);
+                            Console.WriteLine("storyID identificado: " + storyID);
+                            Console.WriteLine("storySlug identificado: " + storySlug);
+                            var conteudoCompleto = roStorySend.Element("storyBody")?.Value ?? "";
+                            Console.WriteLine("storyBody : " + conteudoCompleto);
+
+                            var matches = Regex.Matches(conteudoCompleto, @"\[CG\s*:(.*?)\]");
+
+                            foreach (Match match in matches)
+                            {
+                                string conteudo = match.Groups[1].Value; // tudo que estava dentro
+                                Console.WriteLine($"Capturado: {conteudo}");
+                                // Se quiser fazer split por barra invertida '\'
+                                var partes = conteudo.Split('\\');
+                                Console.WriteLine("Partes:");
+                                foreach (var p in partes)
+                                {
+                                    Console.WriteLine($" - {p}");
+                                }
+                                Console.WriteLine();
+                            }
+
+                            // Se quiser apenas o conteúdo interno (sem a tag <roStorySend>)
+                            //string conteudoInterno = string.Concat(roStorySend.Elements());
+                            //Console.WriteLine(conteudoInterno);
+                        }                        
+
+                        var roReadyToAir = doc.Root.Element("roReadyToAir");
+                        if (roReadyToAir != null)
+                        {
+                            roId = roReadyToAir.Element("roID")?.Value ?? "";
+                            Console.WriteLine("roReadyToAir identificado: " + roId);
+                        }
+
+                        var roDelete = doc.Root.Element("roDelete");
+                        if (roDelete != null)
+                        {
+                            roId = roDelete.Element("roID")?.Value ?? "";
+                            Console.WriteLine("roDelete identificado: " + roId);
+                        }
+
+                        // tratar roReq
+                        var roReq = doc.Root.Element("roReq");
+                        if (roReq != null)
+                        {
+                            roId = roReq.Element("roID")?.Value ?? "";
+                            Console.WriteLine("roReq identificado: " + roId);
+                        }
+
+                        var roElementAction = doc.Root.Element("roElementAction");
+                        if (roElementAction != null)
+                        {
+                            roId = roElementAction.Element("roID")?.Value ?? "";
+                            Console.WriteLine("roElementAction identificado: " + roId);
+                            //string ack = $"<mos><roAck><roID>{EscapeXml(roId)}</roID><roStatus>OK</roStatus></roAck></mos>";
+                            //await SendResponse(stream, ack, encoding);
+                        }
+
+                        if (! string.IsNullOrEmpty(roId))
+                        {
+                            string ack = $"<mos><roAck><roID>{EscapeXml(roId)}</roID><roStatus>OK</roStatus></roAck></mos>";
+                            await SendResponse(stream, ack, encoding);
+                        }
+
+                        else
+                        {
+                            Console.WriteLine("Comando MOS não identificado; enviando ack genérico.");
+                            string ack = "<mos><roAck><roStatus>OK</roStatus></roAck></mos>";
+                            await SendResponse(stream, ack, encoding);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("Erro ao parsear XML: " + ex.Message);
+                        // opcional: enviar roAck com erro
+                        string ack = "<mos><roAck><roStatus>ERROR</roStatus></roAck></mos>";
+                        await SendResponse(stream, ack, encoding);
+                    }
+
+                    // calcular quantos bytes consumimos do buffer original
+                    // note: xmlString está sem BOM char; precisamos do tamanho em bytes dessa substring na mesma codificação
+                    int consumedBytesOfUsable = encoding.GetByteCount(xmlString);
+                    int totalConsumed = bomOffset + consumedBytesOfUsable;
+
+                    // remover do bufferList os bytes consumidos
+                    bufferList.RemoveRange(0, totalConsumed);
+
+                    // Pode haver mais mensagens no buffer → repetir
+                    if (bufferList.Count > 0) loop = true;
+                } // while loop
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Erro na conexão com {endpoint}: {ex.Message}");
+        }
+        finally
+        {
+            Console.WriteLine($"Conexão encerrada com {endpoint}");
+            client.Close();
+        }
+    }
+
+    // Detecta encoding com BOM ou heurística simples (UTF-16LE / UTF-16BE / UTF-8)
+    static Encoding DetectEncoding(byte[] bytes)
+    {
+        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) return Encoding.UTF8;
+        if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) return Encoding.Unicode; // UTF-16LE
+        if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) return Encoding.BigEndianUnicode; // UTF-16BE
+
+        // heurística: contar zeros nos bytes pares/ímpares
+        int evenZero = 0, oddZero = 0;
+        int pairs = Math.Min(bytes.Length / 2, 1000);
+        for (int i = 0; i + 1 < bytes.Length && i / 2 < pairs; i += 2)
+        {
+            if (bytes[i] == 0) evenZero++;
+            if (bytes[i + 1] == 0) oddZero++;
+        }
+
+        if (evenZero + oddZero == 0)
+        {
+            return Encoding.UTF8; // provavelmente UTF-8/ASCII
+        }
+
+        // se zeros aparecem mais nas posições pares => UTF-16BE
+        if (evenZero > oddZero) return Encoding.BigEndianUnicode;
+        return Encoding.Unicode; // caso contrário, UTF-16LE
+    }
+
+    // Envia resposta utilizando a mesma encoding do cliente (inclui BOM para UTF-16)
+    static async Task SendResponse(NetworkStream stream, string xmlBody, Encoding encoding)
+    {
+        // garantir declaração XML (opcional)
+        string encName = encoding == Encoding.Unicode ? "UTF-16LE" :
+                         encoding == Encoding.BigEndianUnicode ? "UTF-16BE" :
+                         "UTF-8";
+
+        string xml = xmlBody.Trim();
+        if (!xml.StartsWith("<?xml", StringComparison.OrdinalIgnoreCase))
+        {
+            xml = $"<?xml version=\"1.0\" encoding=\"{encName}\"?>\r\n" + xml;
+        }
+
+        byte[] payload = encoding.GetBytes(xml);
+
+        // adicionar BOM se UTF-16
+        if (encoding == Encoding.Unicode)
+        {
+            payload = Prepend(new byte[] { 0xFF, 0xFE }, payload);
+        }
+        else if (encoding == Encoding.BigEndianUnicode)
+        {
+            payload = Prepend(new byte[] { 0xFE, 0xFF }, payload);
+        }
+        // para UTF-8 não colocamos BOM por padrão (mas poderia se desejar)
+
+        await stream.WriteAsync(payload, 0, payload.Length);
+        Console.WriteLine("Resposta enviada (" + encName + "):\n" + xml);
+    }
+
+    static byte[] Prepend(byte[] prefix, byte[] data)
+    {
+        var outb = new byte[prefix.Length + data.Length];
+        Buffer.BlockCopy(prefix, 0, outb, 0, prefix.Length);
+        Buffer.BlockCopy(data, 0, outb, prefix.Length, data.Length);
+        return outb;
+    }
+
+    // escape simples para inserir em XML (caso necessário)
+    static string EscapeXml(string s) =>
+        s?.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;").Replace("'", "&apos;") ?? "";
+}
