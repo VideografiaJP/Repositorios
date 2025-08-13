@@ -1,66 +1,18 @@
-// Program.cs
 using System;
 using System.Collections.Generic;
+using System.Data.Common;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Transactions;
 using System.Xml.Linq;
 using Npgsql;
-
-//class Program_
-//{
-//    static void Main()
-//    {
-//        // Configurações do seu MOS Gateway
-//        string mosServer = "172.16.2.31"; // IP do ENPS MOS Gateway
-//        int mosPort = 10540; // Porta padrão do MOS (confirme no seu ENPS)
-
-//        // Dados do roStorySend
-//        string roID = "SRV-013-ENPS01;P_VIDEOGRA\\W;BFAA1917";
-//        string storyID = "STORY123";
-//        string storySlug = "Minha Matéria";
-//        string storyBody = "Texto da minha matéria enviado pelo MOS.";
-
-//        // Monta o XML roStorySend
-//        XDocument roStorySend = new XDocument(
-//            new XElement("mos",
-//                new XElement("mosID", "VMIX.MOS"), // Seu MOS ID
-//                new XElement("ncsID", "SRV-013-ENPS01"), // ID do ENPS
-//                new XElement("roStorySend",
-//                    new XElement("roID", roID),
-//                    new XElement("storyID", storyID),
-//                    new XElement("storySlug", storySlug),
-//                    new XElement("storyBody",
-//                        new XElement("storyText", storyBody)
-//                    )
-//                )
-//            )
-//        );
-
-//        string xmlString = roStorySend.Declaration + roStorySend.ToString();
-
-//        // Conecta ao servidor MOS e envia
-//        try
-//        {
-//            using (TcpClient client = new TcpClient(mosServer, mosPort))
-//            using (NetworkStream stream = client.GetStream())
-//            {
-//                byte[] data = Encoding.UTF8.GetBytes(xmlString);
-//                stream.Write(data, 0, data.Length);
-//                Console.WriteLine("✅ roStorySend enviado com sucesso!");
-//            }
-//        }
-//        catch (Exception ex)
-//        {
-//            Console.WriteLine("❌ Erro ao enviar roStorySend: " + ex.Message);
-//        }
-//    }
-//}
 
 public class Models
 {
@@ -73,6 +25,7 @@ public class Dados
 {
     private string mosId = "VMIX.MOS";
     private string ncsID = "SRV-013-ENPS01";
+    public int idEmpresa = 2; 
 
     private readonly string cnPG;
     //NpgsqlConnection conn;
@@ -112,7 +65,7 @@ public class Dados
                 VALUES (@Programa, @Identificador, @mosID, @ncsID, @Titulo) ON CONFLICT (""Identificador"") DO NOTHING RETURNING ""Id"";";
 
             await using var insertRundownCmd = new NpgsqlCommand(insertRundownSql, conn, transaction);
-            insertRundownCmd.Parameters.AddWithValue("Programa", 11);
+            insertRundownCmd.Parameters.AddWithValue("Programa", idEmpresa);
             insertRundownCmd.Parameters.AddWithValue("Identificador", item.Element("roID")?.Value ?? (object)DBNull.Value);
             insertRundownCmd.Parameters.AddWithValue("mosID", mosId);
             insertRundownCmd.Parameters.AddWithValue("ncsID", ncsID);
@@ -136,7 +89,7 @@ public class Dados
             insertStoryCmd.Parameters.Add("Titulo", NpgsqlTypes.NpgsqlDbType.Text);
             insertStoryCmd.Parameters.Add("Ordem", NpgsqlTypes.NpgsqlDbType.Integer);
 
-            int order = 0;
+            int order = 1;
             foreach (var s in item.Elements("story"))
             {
                 insertStoryCmd.Parameters["RundownId"].Value = rundownId;
@@ -178,7 +131,7 @@ public class Dados
                 const string insertStorySql = @"INSERT INTO ""MOS"".""Stories"" (""RundownId"", ""roId"", ""Identificador"", ""Titulo"", ""Ordem"") 
                 VALUES ((SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1), @roId, @Identificador, @Titulo, 
                 COALESCE((SELECT MAX(""Ordem"") + 1 FROM ""MOS"".""Stories"" WHERE ""RundownId"" = 
-                (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1)),1));";
+                (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1)),1)) ON CONFLICT (""roId"") DO NOTHING RETURNING ""Id"";";
 
                 await using var insertStoryCmd = new NpgsqlCommand(insertStorySql, conn, transaction);
                 insertStoryCmd.Parameters.Add("RundownId", NpgsqlTypes.NpgsqlDbType.Text);
@@ -286,10 +239,13 @@ public class Dados
         }
     }
 
-    public async Task UpdateroElementAction(XElement item)
+    public async Task UpdateOrdemroElementAction(XElement item)
     {
         var storyIdTarget = item.Element("element_target").Element("storyID").Value ?? "";
         var storyIdSource = item.Element("element_source").Element("storyID").Value ?? "";
+        var roID = item.Element("roID").Value ?? "";
+        //if (string.IsNullOrEmpty(roID))
+        //    roID = storyID.Substring(0, storyID.LastIndexOf(';'));
 
         await using var conn = new NpgsqlConnection(cnPG);
         await conn.OpenAsync();
@@ -305,25 +261,40 @@ public class Dados
             ordemTarget = Convert.ToInt32(await cmd.ExecuteScalarAsync());
         }
 
-        await using (var cmd = new NpgsqlCommand(getOrderSql, conn, tx))
-        {
-            cmd.Parameters.AddWithValue("id", storyIdSource);
-            ordemSource = Convert.ToInt32(await cmd.ExecuteScalarAsync());
-        }
+        //await using (var cmd = new NpgsqlCommand(getOrderSql, conn, tx))
+        //{
+        //    cmd.Parameters.AddWithValue("id", storyIdSource);
+        //    ordemSource = Convert.ToInt32(await cmd.ExecuteScalarAsync());
+        //}
 
         var updateSql = @"UPDATE ""MOS"".""Stories"" SET ""Ordem"" = @ordem WHERE ""roId"" = @storyID";
         await using (var cmd = new NpgsqlCommand(updateSql, conn, tx))
         {
-            cmd.Parameters.AddWithValue("ordem", ordemSource);
-            cmd.Parameters.AddWithValue("storyID", storyIdSource);
+            cmd.Parameters.AddWithValue("ordem", ordemTarget + 1);
+            cmd.Parameters.AddWithValue("storyID", storyIdTarget);
             var _ = await cmd.ExecuteNonQueryAsync();
+            Console.WriteLine(_);
         }
+
         await using (var cmd = new NpgsqlCommand(updateSql, conn, tx))
         {
             cmd.Parameters.AddWithValue("ordem", ordemTarget);
-            cmd.Parameters.AddWithValue("storyID", storyIdTarget);            
-            var __ = await cmd.ExecuteNonQueryAsync();
+            cmd.Parameters.AddWithValue("storyID", storyIdSource);
+            var _ = await cmd.ExecuteNonQueryAsync();
+            Console.WriteLine(_);
         }
+
+
+        //const string updateOrdemAllsql = @"update ""MOS"".""Stories"" set ""Ordem"" = ""Ordem"" + 1 where ""Ordem"" >= (SELECT ""Ordem"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId)
+        //    and ""RundownId"" = (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1)";
+        //await using (var cmd = new NpgsqlCommand(updateOrdemAllsql, conn, tx))
+        //{
+        //    cmd.Parameters.AddWithValue("RundownId", roID);
+        //    cmd.Parameters.AddWithValue("roId", storyIdSource);
+
+        //    var x = await cmd.ExecuteNonQueryAsync();
+        //    Console.WriteLine(x);
+        //}
 
         await tx.CommitAsync();
     }
@@ -343,54 +314,113 @@ public class Dados
             
             var storyID = item.Element("element_source").Element("story").Element("storyID")?.Value ?? "";
             var storySlug = item.Element("element_source").Element("story").Element("storySlug")?.Value ?? "";
-
             var storyIDOrdem = item.Element("element_target").Element("storyID")?.Value ?? "";
+            int ordemTarget = 1;
 
-            var getOrderSql = @"SELECT ""Ordem"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @id";
-
-            int ordemTarget;
-
-            await using (var cmd = new NpgsqlCommand(getOrderSql, conn))
-            {
-                cmd.Parameters.AddWithValue("id", storyIDOrdem);
-                ordemTarget = Convert.ToInt32(await cmd.ExecuteScalarAsync());
-            }
-
-            //const string insertStorySql = @"INSERT INTO ""MOS"".""Stories"" (""RundownId"", ""roId"", ""Identificador"", ""Titulo"", ""Ordem"") 
-            //    VALUES ((SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1), @roId, @Identificador, @Titulo, 
-            //    COALESCE((SELECT MAX(""Ordem"") + 1 FROM ""MOS"".""Stories"" WHERE ""RundownId"" = 
-            //    (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1)),1)) ON CONFLICT (""roId"") DO NOTHING RETURNING ""Id"";;";
-
-            const string insertStorySql = @"INSERT INTO ""MOS"".""Stories"" (""RundownId"", ""roId"", ""Identificador"", ""Titulo"", ""Ordem"") 
-                VALUES ((SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1), @roId, @Identificador, @Titulo, @Ordem)
+            // inserir ocupando a posicao do anterior
+            var insertStorySql = @"INSERT INTO ""MOS"".""Stories"" (""RundownId"", ""roId"", ""Identificador"", ""Titulo"", ""Ordem"") 
+                VALUES ((SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1), @roId, @Identificador, @Titulo, @Ordem) 
                 ON CONFLICT (""roId"") DO NOTHING RETURNING ""Id"";";
 
-            await using var insertStoryCmd = new NpgsqlCommand(insertStorySql, conn, transaction);
-            insertStoryCmd.Parameters.Add("RundownId", NpgsqlTypes.NpgsqlDbType.Text);
-            insertStoryCmd.Parameters.Add("roId", NpgsqlTypes.NpgsqlDbType.Text);
-            insertStoryCmd.Parameters.Add("Identificador", NpgsqlTypes.NpgsqlDbType.Text);
-            insertStoryCmd.Parameters.Add("Titulo", NpgsqlTypes.NpgsqlDbType.Text);
-            insertStoryCmd.Parameters.Add("Ordem", NpgsqlTypes.NpgsqlDbType.Integer);
+            if (string.IsNullOrEmpty(storyIDOrdem))
+            {
+                insertStorySql = @"INSERT INTO ""MOS"".""Stories"" (""RundownId"", ""roId"", ""Identificador"", ""Titulo"", ""Ordem"") 
+                VALUES ((SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1), @roId, @Identificador, @Titulo, 
+                COALESCE((SELECT MAX(""Ordem"") + 1 FROM ""MOS"".""Stories"" WHERE ""RundownId"" = 
+                (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1)),1)) ON CONFLICT (""roId"") DO NOTHING RETURNING ""Id"";";
+            }           
+            else
+            {
+                var getOrderSql = @"SELECT ""Ordem"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @id";
 
-            insertStoryCmd.Parameters["RundownId"].Value = roId;
-            insertStoryCmd.Parameters["roId"].Value = storyID;
-            insertStoryCmd.Parameters["Identificador"].Value = Guid.NewGuid().ToString();
-            insertStoryCmd.Parameters["Titulo"].Value = storySlug;
-            insertStoryCmd.Parameters["Ordem"].Value = ordemTarget;            
+                await using (var cmd = new NpgsqlCommand(getOrderSql, conn, transaction))
+                {
+                    cmd.Parameters.AddWithValue("id", storyIDOrdem);
+                    ordemTarget = Convert.ToInt32(await cmd.ExecuteScalarAsync());
+                }
 
-            await insertStoryCmd.ExecuteNonQueryAsync();
+                //const string updateOrdemAllsql = @"update ""MOS"".""Stories"" set ""Ordem"" = ""Ordem"" + 1 where ""roId"" = @roId";
+                //await using var updateOrdemAllCmd = new NpgsqlCommand(updateOrdemAllsql, conn, transaction);
+                //updateOrdemAllCmd.Parameters.Add("roId", NpgsqlTypes.NpgsqlDbType.Text);
+                //updateOrdemAllCmd.Parameters["roId"].Value = storyIDOrdem;
 
-            const string updateOrdemAllsql = @"update ""MOS"".""Stories"" set ""Ordem"" = ""Ordem"" + 1 where ""Ordem"" >= @Ordem";
-            await using var updateOrdemAllCmd = new NpgsqlCommand(updateOrdemAllsql, conn, transaction);
-            updateOrdemAllCmd.Parameters.Add("Ordem", NpgsqlTypes.NpgsqlDbType.Integer);
-            updateOrdemAllCmd.Parameters["Ordem"].Value = ordemTarget;
+                //var _ = await updateOrdemAllCmd.ExecuteNonQueryAsync();
+                //Console.WriteLine(_);
 
-            await updateOrdemAllCmd.ExecuteNonQueryAsync();
+                const string updateOrdemAllsql = @"update ""MOS"".""Stories"" set ""Ordem"" = ""Ordem"" + 1 where ""Ordem"" >= @ordemTarget
+                and ""RundownId"" = (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1)";
+                await using (var cmd = new NpgsqlCommand(updateOrdemAllsql, conn, transaction))
+                {
+                    cmd.Parameters.Add("RundownId", NpgsqlTypes.NpgsqlDbType.Text);
+                    cmd.Parameters["RundownId"].Value = roId;
+                    cmd.Parameters.Add("ordemTarget", NpgsqlTypes.NpgsqlDbType.Integer);
+                    cmd.Parameters["ordemTarget"].Value = ordemTarget;
+
+                    var _ = await cmd.ExecuteNonQueryAsync();
+                    //Console.WriteLine("atualizados: " + _);
+                }
+            }
+
+            await using (var cmd = new NpgsqlCommand(insertStorySql, conn, transaction))
+            {
+                cmd.Parameters.Add("RundownId", NpgsqlTypes.NpgsqlDbType.Text);
+                cmd.Parameters.Add("roId", NpgsqlTypes.NpgsqlDbType.Text);
+                //insertStoryCmd.Parameters.Add("id", NpgsqlTypes.NpgsqlDbType.Text);
+                cmd.Parameters.Add("Identificador", NpgsqlTypes.NpgsqlDbType.Text);
+                cmd.Parameters.Add("Titulo", NpgsqlTypes.NpgsqlDbType.Text);
+                cmd.Parameters.Add("Ordem", NpgsqlTypes.NpgsqlDbType.Integer);
+
+                cmd.Parameters["RundownId"].Value = roId;
+                cmd.Parameters["roId"].Value = storyID;
+                //insertStoryCmd.Parameters["id"].Value = storyIDOrdem;
+                cmd.Parameters["Identificador"].Value = Guid.NewGuid().ToString();
+                cmd.Parameters["Titulo"].Value = storySlug;
+                cmd.Parameters["Ordem"].Value = ordemTarget;
+
+                var __ = await cmd.ExecuteNonQueryAsync();
+                //Console.WriteLine("adicionado: " + __);
+            }
+
+            if (1 == 2)
+            {
+                if (!string.IsNullOrEmpty(storyIDOrdem))
+                {
+                    //const string updateOrdemAllsql = @"update ""MOS"".""Stories"" set ""Ordem"" = ""Ordem"" + 1 where ""roId"" = @roId";
+                    //await using var updateOrdemAllCmd = new NpgsqlCommand(updateOrdemAllsql, conn, transaction);
+                    ////updateOrdemAllCmd.Parameters.Add("RundownId", NpgsqlTypes.NpgsqlDbType.Text);
+                    ////updateOrdemAllCmd.Parameters["RundownId"].Value = roId;
+                    //updateOrdemAllCmd.Parameters.Add("roId", NpgsqlTypes.NpgsqlDbType.Text);
+                    //updateOrdemAllCmd.Parameters["roId"].Value = storyID;
+                    ////updateOrdemAllCmd.Parameters.Add("id", NpgsqlTypes.NpgsqlDbType.Text);
+                    ////updateOrdemAllCmd.Parameters["id"].Value = storyIDOrdem;
+
+                    //var _ = await updateOrdemAllCmd.ExecuteNonQueryAsync();
+                    //Console.WriteLine(_);
+                }
+            }
+            
+            if (! string.IsNullOrEmpty(storyIDOrdem))
+            {
+                //return;
+                //const string updateOrdemAllsql = @"update ""MOS"".""Stories"" set ""Ordem"" = ""Ordem"" + 1 where ""Ordem"" >= (SELECT ""Ordem"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @id)
+                //and ""roId"" <> @roId and ""RundownId"" = (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1)";
+                //await using var updateOrdemAllCmd = new NpgsqlCommand(updateOrdemAllsql, conn, transaction);
+                //updateOrdemAllCmd.Parameters.Add("RundownId", NpgsqlTypes.NpgsqlDbType.Text);
+                //updateOrdemAllCmd.Parameters["RundownId"].Value = roId;
+                //updateOrdemAllCmd.Parameters.Add("roId", NpgsqlTypes.NpgsqlDbType.Text);
+                //updateOrdemAllCmd.Parameters["roId"].Value = storyID;
+                //updateOrdemAllCmd.Parameters.Add("id", NpgsqlTypes.NpgsqlDbType.Text);
+                //updateOrdemAllCmd.Parameters["id"].Value = storyIDOrdem;
+
+                //var _ = await updateOrdemAllCmd.ExecuteNonQueryAsync();
+                //Console.WriteLine(_);
+            }
 
             await transaction.CommitAsync();
         }
-        catch
+        catch (Exception ex)
         {
+            Console.WriteLine("sql error: " + ex.Message.ToString());
             await transaction.RollbackAsync();
             throw;
         }
@@ -438,13 +468,17 @@ public class Dados
         await using var transaction = await conn.BeginTransactionAsync();
         try
         {
-            var roID = item.Element("element_source").Element("storyID").Value ?? "";
+            var storyID = item.Element("element_source").Element("storyID").Value ?? "";
+            var roID = item.Element("roID").Value ?? "";
+            if (string.IsNullOrEmpty(roID))
+                roID = storyID.Substring(0, storyID.LastIndexOf(';'));
+
             const string deleteStoriesCreditoSql = @"DELETE FROM ""MOS"".""StoryCreditos"" WHERE ""StoryId"" IN
                 (SELECT ""Id"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId LIMIT 1);";
 
             await using (var cmd = new NpgsqlCommand(deleteStoriesCreditoSql, conn, transaction))
             {
-                cmd.Parameters.AddWithValue("roId", roID);
+                cmd.Parameters.AddWithValue("roId", storyID);
                 await cmd.ExecuteNonQueryAsync();
             }            
 
@@ -453,18 +487,28 @@ public class Dados
 
             await using (var cmd = new NpgsqlCommand(deleteStoriesTarjaSql, conn, transaction))
             {
-                cmd.Parameters.AddWithValue("roID", roID);
+                cmd.Parameters.AddWithValue("roID", storyID);
                 await cmd.ExecuteNonQueryAsync();
+            }
+
+            const string updateOrdemAllsql = @"update ""MOS"".""Stories"" set ""Ordem"" = ""Ordem"" - 1 where ""Ordem"" >= (SELECT ""Ordem"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId)
+            and ""RundownId"" = (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1)";
+            await using (var cmd = new NpgsqlCommand(updateOrdemAllsql, conn, transaction))
+            {
+                cmd.Parameters.AddWithValue("RundownId", roID);
+                cmd.Parameters.AddWithValue("roId", storyID);
+
+                var x = await cmd.ExecuteNonQueryAsync();
             }
 
             const string deleteStoriesSql = @"DELETE FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId;";
 
             await using (var cmd = new NpgsqlCommand(deleteStoriesSql, conn, transaction))
             {
-                cmd.Parameters.AddWithValue("roID", roID);
+                cmd.Parameters.AddWithValue("roID", storyID);
                 await cmd.ExecuteNonQueryAsync();
             }
-            
+
             await transaction.CommitAsync();
         }
         catch
@@ -528,6 +572,40 @@ public class Dados
         }
     }
 
+    public async Task EnviarRoReqAllAsync(string host, int porta, string roID)
+    {
+        Console.WriteLine("====== iniciio requisicao reqAll");
+        // Monta o XML
+        //var xml = new XElement("roReqAll",
+        //    new XElement("roID", roID)
+        //).ToString(SaveOptions.DisableFormatting);
+
+        //// MOS usa mensagens com \r\n no final
+        //var mensagem = xml + "\r\n";
+
+        var xml = new XElement("mos",
+            new XElement("mosID", mosId),
+            new XElement("ncsID", ncsID),
+            new XElement("messageID", Guid.NewGuid().ToString()), // ou contador próprio
+            new XElement("roReqAll", new XElement("roID", roID)
+            )
+        ).ToString(SaveOptions.DisableFormatting);
+
+        var mensagem = xml + "\r\n";
+
+        // Conecta ao MOS
+        using var client = new TcpClient();
+        await client.ConnectAsync(host, porta);
+
+        using var stream = client.GetStream();
+        var buffer = Encoding.UTF8.GetBytes(mensagem);
+
+        // Envia
+        await stream.WriteAsync(buffer, 0, buffer.Length);
+        await stream.FlushAsync();
+
+        Console.WriteLine("======== fim requisicao reqAll");
+    }
 
     //public Models.Crawl getLast(string Tipo)
     //{
@@ -567,9 +645,12 @@ class Program
 {
     static readonly int[] PORTS = { 10540, 10541 };
     public static Dados dados = new Dados();
+    static JsonDocument doc = null;
 
     static async Task Main()
     {
+        //await dados.EnviarRoReqAllAsync("172.16.2.31", 10540, "SRV-013-ENPS01;P_VIDEOGRA\\\\W;03E069B0-3FC3-4935-90163EDE3207D163");
+
         foreach (var p in PORTS) StartServer(p);
         Console.WriteLine("Servidor MOS rodando...");
         await Task.Delay(-1);
@@ -618,6 +699,8 @@ class Program
 
     static void StartServer(int port)
     {
+        LoadPrograms();
+
         var listener = new TcpListener(IPAddress.Any, port);
         listener.Start();
         Console.WriteLine($"Escutando na porta {port}");
@@ -631,6 +714,34 @@ class Program
         });
     }
 
+    static async Task LoadPrograms()
+    {
+        using var http = new HttpClient();
+        string url = "http://172.16.1.140:3000/api/programas/tarjasenews";
+        string json = await http.GetStringAsync(url);
+
+        doc = JsonDocument.Parse(json);
+    }
+
+    static int getProgram(string identificador)
+    {
+        string identificador_ = identificador.Split(';')[1].Split('\\')[0];
+        int program = 0;
+
+        foreach (var item in doc.RootElement.GetProperty("itens").EnumerateArray())
+        {
+            if (item.TryGetProperty("IdentificadorMOS", out var mosProp))
+            {
+                if (mosProp.GetString() == identificador_)
+                {
+                    return item.GetProperty("Id").GetInt32();
+                }
+            }
+        }
+
+        return program;
+    }
+    
     static async Task HandleClient(TcpClient client, int port)
     {
         var endpoint = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
@@ -725,6 +836,7 @@ class Program
                         if (roCreate != null)
                         {
                             roId = roCreate.Element("roID")?.Value ?? "";
+                            dados.idEmpresa = getProgram(roId.ToString());
                             Console.WriteLine("roCreate identificado: " + roId);
                             await dados.AddRoCreate(roCreate);
                         }
@@ -736,27 +848,27 @@ class Program
                             roId = roStorySend.Element("roID")?.Value ?? "";
                             var storyID = roStorySend.Element("storyID")?.Value ?? "";
                             var storySlug = roStorySend.Element("storySlug")?.Value ?? "";
-                            Console.WriteLine("roStorySend identificado: " + roId);
-                            Console.WriteLine("storyID identificado: " + storyID);
-                            Console.WriteLine("storySlug identificado: " + storySlug);
+                            //Console.WriteLine("roStorySend identificado: " + roId);
+                            //Console.WriteLine("storyID identificado: " + storyID);
+                            //Console.WriteLine("storySlug identificado: " + storySlug);
                             var conteudoCompleto = roStorySend.Element("storyBody")?.Value ?? "";
                             //Console.WriteLine("storyBody : " + conteudoCompleto);
 
-                            var matches = Regex.Matches(conteudoCompleto, @"\[CG\s*:(.*?)\]");
+                            //var matches = Regex.Matches(conteudoCompleto, @"\[CG\s*:(.*?)\]");
 
-                            foreach (Match match in matches)
-                            {
-                                string conteudo = match.Groups[1].Value; // tudo que estava dentro
-                                Console.WriteLine($"Capturado: {conteudo}");
-                                // Se quiser fazer split por barra invertida '\'
-                                var partes = conteudo.Split('\\');
-                                Console.WriteLine("Partes:");
-                                foreach (var p in partes)
-                                {
-                                    Console.WriteLine($" - {p}");
-                                }
-                                //Console.WriteLine();
-                            }
+                            //foreach (Match match in matches)
+                            //{
+                            //    string conteudo = match.Groups[1].Value; // tudo que estava dentro
+                            //    Console.WriteLine($"Capturado: {conteudo}");
+                            //    // Se quiser fazer split por barra invertida '\'
+                            //    var partes = conteudo.Split('\\');
+                            //    Console.WriteLine("Partes:");
+                            //    foreach (var p in partes)
+                            //    {
+                            //        Console.WriteLine($" - {p}");
+                            //    }
+                            //    //Console.WriteLine();
+                            //}
 
                             await dados.AddRoStorySend(roStorySend);                            
 
@@ -811,7 +923,7 @@ class Program
                             if ((roElementAction.Attribute("operation")?.Value ?? "") == "MOVE")
                             {
                                 Console.WriteLine("move story");
-                                await dados.UpdateroElementAction(roElementAction);
+                                await dados.UpdateOrdemroElementAction(roElementAction);
                             }
                             if ((roElementAction.Attribute("operation")?.Value ?? "") == "DELETE")
                             {
