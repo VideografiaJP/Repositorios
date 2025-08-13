@@ -1,0 +1,139 @@
+using System.Net.WebSockets;
+using System.Text;
+using System.Diagnostics;
+using System.Text.Json;
+
+var builder = WebApplication.CreateBuilder(args);
+builder.WebHost.UseUrls("http://0.0.0.0:5000");
+//builder.WebHost.UseUrls("http://localhost:5000");
+
+var app = builder.Build();
+
+app.UseWebSockets();
+
+//bool EmExecucao(string nomeProcesso)
+//{
+//    return Process.GetProcessesByName(nomeProcesso).Any();
+//}
+
+// Uso:
+//bool vmixRodando = EmExecucao("vMix64");
+
+//if (vmixRodando)
+//    Console.WriteLine("vMix já está em execução");
+//else
+//    Console.WriteLine("vMix ainda não está rodando");
+//Console.WriteLine(builder.Configuration["appSettings:vMixPath"]);
+
+
+app.Map("/ws", async context =>
+{
+    if (context.WebSockets.IsWebSocketRequest)
+    {
+        using var webSocket = await context.WebSockets.AcceptWebSocketAsync();
+        Console.WriteLine("🟢 Cliente conectado");
+
+        var buffer = new byte[1024 * 4];
+
+        while (true)
+        {
+            var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+
+            if (result.MessageType == WebSocketMessageType.Close)
+            {
+                Console.WriteLine("Cliente desconectado");
+                await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Conexão encerrada", CancellationToken.None);
+                break;
+            }
+
+            var jsonString = Encoding.UTF8.GetString(buffer, 0, result.Count);
+            Console.WriteLine($"JSON recebido: {jsonString}");
+
+            try
+            {
+                var command = JsonSerializer.Deserialize<CommandMessage>(jsonString);
+
+                if (command != null && command.Command == "openProgram")
+                {
+                    var vMixProcess_ = builder.Configuration["appSettings:vMixProcess"];
+                    var vMixFileName_ = builder.Configuration["appSettings:vMixFileName"];
+                    var vMixPath = builder.Configuration["appSettings:vMixPath"];
+
+                    if (vMixProcess_ == command.Program)
+                    {
+                        Console.WriteLine($"Verificando se {command.Program} está em execução...");
+
+                        var processos = Process.GetProcessesByName(command.Program);
+
+                        if (processos.Length > 0)
+                        {
+                            Console.WriteLine($"{command.Program} já está em execução. Encerrando...");
+
+                            foreach (var proc in processos)
+                            {
+                                try
+                                {
+                                    proc.Kill(true); // true: encerra subprocessos
+                                    proc.WaitForExit();
+                                    Console.WriteLine($"Processo {proc.Id} encerrado.");
+                                }
+                                catch (Exception ex)
+                                {
+                                    Console.WriteLine($"Erro ao encerrar {command.Program}: {ex.Message}");
+                                }
+                            }
+
+                            await Task.Delay(500); // pequena pausa para garantir fechamento completo
+                        }
+                        else
+                        {
+                            Console.WriteLine($"{command.Program} não está em execução.");
+                        }
+
+                        try
+                        {
+                            Process.Start(new ProcessStartInfo
+                            {
+                                WorkingDirectory = vMixPath,
+                                FileName = vMixFileName_,
+                                UseShellExecute = true
+                            });
+
+                            var response = Encoding.UTF8.GetBytes($"{command.Program} foi aberto com sucesso");
+                            await webSocket.SendAsync(new ArraySegment<byte>(response), WebSocketMessageType.Text, true, CancellationToken.None);
+                        }
+                        catch (Exception ex)
+                        {
+                            var error = Encoding.UTF8.GetBytes($"Erro ao abrir {command.Program}: {ex.Message}");
+                            await webSocket.SendAsync(new ArraySegment<byte>(error), WebSocketMessageType.Text, true, CancellationToken.None);
+                        }
+                    }
+                    else
+                    {
+                        var error = Encoding.UTF8.GetBytes("Programa não autorizado");
+                        await webSocket.SendAsync(new ArraySegment<byte>(error), WebSocketMessageType.Text, true, CancellationToken.None);
+                    }
+                }
+                else
+                {
+                    var error = Encoding.UTF8.GetBytes("Comando inválido");
+                    await webSocket.SendAsync(new ArraySegment<byte>(error), WebSocketMessageType.Text, true, CancellationToken.None);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Erro ao processar JSON: " + ex.Message);
+                var error = Encoding.UTF8.GetBytes("Erro ao processar comando");
+                await webSocket.SendAsync(new ArraySegment<byte>(error), WebSocketMessageType.Text, true, CancellationToken.None);
+            }
+        }
+    }
+    else
+    {
+        context.Response.StatusCode = 400;
+    }
+});
+
+app.Run();
+
+record CommandMessage(string Command, string Program);//, string ProgramFolder);
