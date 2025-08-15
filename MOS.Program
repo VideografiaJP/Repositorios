@@ -13,1038 +13,493 @@ using System.Threading.Tasks;
 using System.Transactions;
 using System.Xml.Linq;
 using Npgsql;
+using Microsoft.Win32;
+using NCrontab;
+using JovemPan.Socket;
 
-public class Models
+namespace JovemPan.Socket
 {
-    public class Log
+    class Program
     {
-        public string Message { get; set; }
-    }
-}
-public class Dados
-{
-    private string mosId = "VMIX.MOS";
-    private string ncsID = "SRV-013-ENPS01";
-    public int idEmpresa = 2; 
+        static readonly int[] PORTS = { 10540, 10541 };
+        public static Dados dados = new Dados();
+        static JsonDocument doc = null;
 
-    private readonly string cnPG;
-    //NpgsqlConnection conn;
-    public Dados()
-    {
-        cnPG = "Host=172.16.1.216;Username=videografia;Password=Jovemp@n;Search Path=Crawl;Database=VideografiaApps;";
-        //cnPG = "Host=127.0.0.1;Username=postgres;Password=postgres;Search Path=Crawl;Database=local;";
-        //conn = new NpgsqlConnection(cnPG);
-        //conn.Open();
-    }
+        static string mosServerIP = "172.16.2.31"; // IP do servidor MOS 
+        static int mosServerPort = 10541; // Porta TCP do MOS
+        static string localMosID = "VMIX.MOS"; // Seu ID MOS
+        static string remoteMosID = "SRV-013-ENPS01"; // ID do servidor MOS
 
-    public async Task AddLogAsync(Models.Log item)
-    {
-        // Sempre usar await using para garantir que a conexão seja fechada
-        await using var conn = new NpgsqlConnection(cnPG);
-        await conn.OpenAsync();
-
-        // Use parâmetros nomeados (mais claro e evita confusão com ordem)
-        const string sql = @"INSERT INTO ""MOS"".""Logs"" (""Message"") VALUES (@message)";
-
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("message", item.Message ?? (object)DBNull.Value);
-
-        await cmd.ExecuteNonQueryAsync();
-    }
-
-    public async Task AddRoCreate(XElement item)
-    {
-        await using var conn = new NpgsqlConnection(cnPG);
-        await conn.OpenAsync();
-
-        await using var transaction = await conn.BeginTransactionAsync();
-
-        try
+        static async Task Main()
         {
-            const string insertRundownSql = @"INSERT INTO ""MOS"".""Rundowns"" (""Programa"", ""Identificador"", ""mosID"", ""ncsID"", ""Titulo"") 
-                VALUES (@Programa, @Identificador, @mosID, @ncsID, @Titulo) ON CONFLICT (""Identificador"") DO NOTHING RETURNING ""Id"";";
+            Console.WriteLine("Agendador iniciado...");
+            _ = Jobs();
+            foreach (var p in PORTS) StartServer(p);
+            Console.WriteLine("Servidor MOS rodando...");
 
-            await using var insertRundownCmd = new NpgsqlCommand(insertRundownSql, conn, transaction);
-            insertRundownCmd.Parameters.AddWithValue("Programa", idEmpresa);
-            insertRundownCmd.Parameters.AddWithValue("Identificador", item.Element("roID")?.Value ?? (object)DBNull.Value);
-            insertRundownCmd.Parameters.AddWithValue("mosID", mosId);
-            insertRundownCmd.Parameters.AddWithValue("ncsID", ncsID);
-            insertRundownCmd.Parameters.AddWithValue("Titulo", item.Element("roSlug")?.Value ?? (object)DBNull.Value);
+            await Task.Delay(-1);
+        }
 
-            var rundownIdObj = await insertRundownCmd.ExecuteScalarAsync();
-            if (rundownIdObj == null)
+        static async Task Jobs()
+        {
+            //var schedule = CrontabSchedule.Parse("0 5, 6 * * *"); // 05:00 e 06:00
+            var schedule = CrontabSchedule.Parse("* * * * *"); // 05:00 e 06:00
+
+            DateTime next = schedule.GetNextOccurrence(DateTime.Now);
+
+            while (true)
             {
+                var now = DateTime.Now;
+
+                if (now >= next)
+                {
+                    Console.WriteLine($"[{now}] Clean Log");
+                    next = schedule.GetNextOccurrence(now);
+                }
+
+                await Task.Delay(1000);
+            }
+        }
+
+        static async Task getroReqAll_()
+        {
+            string mosServerIP = "172.16.2.31"; // IP do servidor MOS 
+            int mosServerPort = 10540; // Porta TCP do MOS
+            string localMosID = "VMIX.MOS"; // Seu ID MOS
+            string remoteMosID = "SRV-013-ENPS01"; // ID do servidor MOS
+
+            string messageID = Guid.NewGuid().ToString();
+            string messageTime = DateTime.UtcNow.ToString("o"); // formato ISO 8601
+
+            // XML conforme padrão MOS
+            string roReqAllXml =
+                $@"<mos>
+            <mosID>{localMosID}</mosID>
+            <ncsID>{remoteMosID}</ncsID>
+            <messageID>{messageID}</messageID>
+            <messageTime>{messageTime}</messageTime>
+            <roReqAll/>
+        </mos>";
+
+            try
+            {
+                using TcpClient client = new TcpClient();
+                Console.WriteLine($"Conectando ao servidor MOS {mosServerIP}:{mosServerPort}...");
+                await client.ConnectAsync(mosServerIP, mosServerPort);
+
+                using NetworkStream stream = client.GetStream();
+
+                // Adiciona 0x04 (EOT) no final
+                byte[] dataToSend = Encoding.UTF8.GetBytes(roReqAllXml + (char)0x04);
+
+                Console.WriteLine("Enviando roReqAll...");
+                await stream.WriteAsync(dataToSend, 0, dataToSend.Length);
+
+                // MOS normalmente mantém a conexão aberta, mas vamos tentar ler a resposta
+                byte[] buffer = new byte[8192];
+                int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+
+                if (bytesRead > 0)
+                {
+                    string response = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                    Console.WriteLine("Resposta recebida:");
+                    Console.WriteLine("(" + response + ")");
+                }
+                else
+                {
+                    Console.WriteLine("Nenhuma resposta recebida.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Erro: {ex.Message}");
+            }
+        }
+
+        static void StartServer(int port)
+        {
+            _ = LoadPrograms();
+
+            var listener = new TcpListener(IPAddress.Any, port);
+            listener.Start();
+            Console.WriteLine($"Escutando na porta {port}");
+            _ = Task.Run(async () =>
+            {
+                while (true)
+                {
+                    var client = await listener.AcceptTcpClientAsync();
+                    _ = HandleClient(client, port);
+                }
+            });
+        }
+
+        static async Task LoadPrograms()
+        {
+            using var http = new HttpClient();
+            string url = "http://172.16.1.140:3000/api/programas/tarjasenews";
+            string json = await http.GetStringAsync(url);
+
+            doc = JsonDocument.Parse(json);
+        }
+
+        static int getProgram(string identificador)
+        {
+            string identificador_ = identificador.Split(';')[1].Split('\\')[0];
+            int program = 0;
+
+            foreach (var item in doc.RootElement.GetProperty("itens").EnumerateArray())
+            {
+                if (item.TryGetProperty("IdentificadorMOS", out var mosProp))
+                {
+                    if (mosProp.GetString() == identificador_)
+                    {
+                        return item.GetProperty("Id").GetInt32();
+                    }
+                }
+            }
+
+            return program;
+        }
+
+        public static async Task EnviarRoReqAllAsync(NetworkStream mosStream, string mosId, string ncsID, string roID)
+        {
+            if (mosStream == null || !mosStream.CanWrite)
+            {
+                Console.WriteLine("❌ Conexão MOS inativa.");
                 return;
             }
 
-            var rundownId = (int)rundownIdObj;
+            Console.WriteLine("====== início roReqAll");
 
-            const string insertStorySql = @"INSERT INTO ""MOS"".""Stories"" (""RundownId"", ""roId"", ""Identificador"", ""Titulo"", ""Ordem"") 
-                VALUES (@RundownId, @roId, @Identificador, @Titulo, @Ordem);";
+            var xml = new XElement("mos",
+                new XElement("mosID", mosId),
+                new XElement("ncsID", ncsID),
+                new XElement("messageID", Guid.NewGuid().ToString()),
+                new XElement("messageTime", DateTime.UtcNow.ToString("o")),
+                new XElement("roReqAll",
+                    new XElement("roID", roID)
+                )
+            ).ToString(SaveOptions.DisableFormatting);
 
-            await using var insertStoryCmd = new NpgsqlCommand(insertStorySql, conn, transaction);
-            insertStoryCmd.Parameters.Add("RundownId", NpgsqlTypes.NpgsqlDbType.Integer);
-            insertStoryCmd.Parameters.Add("roId", NpgsqlTypes.NpgsqlDbType.Text);
-            insertStoryCmd.Parameters.Add("Identificador", NpgsqlTypes.NpgsqlDbType.Text);
-            insertStoryCmd.Parameters.Add("Titulo", NpgsqlTypes.NpgsqlDbType.Text);
-            insertStoryCmd.Parameters.Add("Ordem", NpgsqlTypes.NpgsqlDbType.Integer);
+            var mensagem = xml + (char)0x04; // Terminador MOS
 
-            int order = 1;
-            foreach (var s in item.Elements("story"))
-            {
-                insertStoryCmd.Parameters["RundownId"].Value = rundownId;
-                insertStoryCmd.Parameters["roId"].Value = s.Element("storyID")?.Value ?? (object)DBNull.Value;
-                insertStoryCmd.Parameters["Identificador"].Value = Guid.NewGuid().ToString();
-                insertStoryCmd.Parameters["Titulo"].Value = s.Element("storySlug")?.Value ?? (object)DBNull.Value;
-                insertStoryCmd.Parameters["Ordem"].Value = order++;
+            var buffer = Encoding.UTF8.GetBytes(mensagem);
+            await mosStream.WriteAsync(buffer, 0, buffer.Length);
+            await mosStream.FlushAsync();
 
-                await insertStoryCmd.ExecuteNonQueryAsync();
-            }
-
-            await transaction.CommitAsync();
+            Console.WriteLine("====== fim roReqAll");
         }
-        catch
+
+        static async Task HandleClient(TcpClient client, int port)
         {
-            // Se der erro, desfaz tudo
-            await transaction.RollbackAsync();
-            throw;
-        }
-    }
+            var endpoint = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
+            Console.WriteLine($"Conexão recebida de {endpoint} na porta {port}");
 
-    public async Task AddRoStorySend(XElement item)
-    {
-        await using var conn = new NpgsqlConnection(cnPG);
-        await conn.OpenAsync();
+            var stream = client.GetStream();
+            var bufferList = new List<byte>();
+            var readBuffer = new byte[4096];
 
-        // Criar uma transação para garantir atomicidade
-        await using var transaction = await conn.BeginTransactionAsync();
-
-        try
-        {
-            var roId = item.Element("roID")?.Value ?? "";
-            var storyID = item.Element("storyID")?.Value ?? "";
-            var storySlug = item.Element("storySlug")?.Value ?? "";
-            var conteudoCompleto = item.Element("storyBody")?.Value ?? "";
-
-            if (string.IsNullOrEmpty(conteudoCompleto))
+            try
             {
-                const string insertStorySql = @"INSERT INTO ""MOS"".""Stories"" (""RundownId"", ""roId"", ""Identificador"", ""Titulo"", ""Ordem"") 
-                VALUES ((SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1), @roId, @Identificador, @Titulo, 
-                COALESCE((SELECT MAX(""Ordem"") + 1 FROM ""MOS"".""Stories"" WHERE ""RundownId"" = 
-                (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1)),1)) ON CONFLICT (""roId"") DO NOTHING RETURNING ""Id"";";
-
-                await using var insertStoryCmd = new NpgsqlCommand(insertStorySql, conn, transaction);
-                insertStoryCmd.Parameters.Add("RundownId", NpgsqlTypes.NpgsqlDbType.Text);
-                insertStoryCmd.Parameters.Add("roId", NpgsqlTypes.NpgsqlDbType.Text);
-                insertStoryCmd.Parameters.Add("Identificador", NpgsqlTypes.NpgsqlDbType.Text);
-                insertStoryCmd.Parameters.Add("Titulo", NpgsqlTypes.NpgsqlDbType.Text);
-
-                insertStoryCmd.Parameters["RundownId"].Value = roId;
-                insertStoryCmd.Parameters["roId"].Value = storyID;
-                insertStoryCmd.Parameters["Identificador"].Value = Guid.NewGuid().ToString();
-                insertStoryCmd.Parameters["Titulo"].Value = item.Element("storySlug")?.Value ?? (object)DBNull.Value;
-
-                await insertStoryCmd.ExecuteNonQueryAsync();
-            }
-
-            else
-            {
-                #region Remove Creditos e Tarjas
-                const string deleteStoriesCreditoSql = @"DELETE FROM ""MOS"".""StoryCreditos"" WHERE ""StoryId"" IN
-                (SELECT ""Id"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId LIMIT 1);";
-
-                await using (var cmd = new NpgsqlCommand(deleteStoriesCreditoSql, conn, transaction))
+                while (true)
                 {
-                    cmd.Parameters.AddWithValue("roId", storyID);
-                    await cmd.ExecuteNonQueryAsync();
-                }
+                    int n = await stream.ReadAsync(readBuffer, 0, readBuffer.Length);
+                    if (n == 0) break; // conexão fechada
 
-                const string deleteStoriesTarjaSql = @"DELETE FROM ""MOS"".""StoryTarjas"" WHERE ""StoryId"" IN
-                (SELECT ""Id"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId LIMIT 1);";
+                    // Append bytes recebidos ao buffer
+                    for (int i = 0; i < n; i++) bufferList.Add(readBuffer[i]);
 
-                await using (var cmd = new NpgsqlCommand(deleteStoriesTarjaSql, conn, transaction))
-                {
-                    cmd.Parameters.AddWithValue("roId", storyID);
-                    await cmd.ExecuteNonQueryAsync();
-                }
-                #endregion
-
-                // creditos
-                const string insertUpdateCreditoSql = @"INSERT INTO ""MOS"".""StoryCreditos"" (""StoryId"", ""Identificador"", ""Nome"", ""Cargo"", ""Ordem"")
-                VALUES ((SELECT ""Id"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId LIMIT 1), @Identificador, @Nome, @Cargo, @Ordem)";
-                //ON CONFLICT (""Identificador"") DO UPDATE
-                //SET ""Nome"" = EXCLUDED.""Nome""; ""Cargo"" = EXCLUDED.""Cargo""; ""Cargo"" = EXCLUDED.""Ordem"";";
-
-                await using var insertCreditoCmd = new NpgsqlCommand(insertUpdateCreditoSql, conn, transaction);
-                insertCreditoCmd.Parameters.Add("roId", NpgsqlTypes.NpgsqlDbType.Text);
-                insertCreditoCmd.Parameters.Add("Identificador", NpgsqlTypes.NpgsqlDbType.Text);
-                insertCreditoCmd.Parameters.Add("Nome", NpgsqlTypes.NpgsqlDbType.Text);
-                insertCreditoCmd.Parameters.Add("Cargo", NpgsqlTypes.NpgsqlDbType.Text);
-                insertCreditoCmd.Parameters.Add("Ordem", NpgsqlTypes.NpgsqlDbType.Integer);
-
-                //tarjas
-                const string insertUpdateTarjaSql = @"INSERT INTO ""MOS"".""StoryTarjas"" (""StoryId"", ""Identificador"", ""Manchete"", ""Linha1"", ""Linha2"", ""Ordem"")
-                VALUES ((SELECT ""Id"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId LIMIT 1), @Identificador, @Manchete, @Linha1, @Linha2, @Ordem)";
-                //ON CONFLICT (""Identificador"") DO UPDATE
-                //SET ""Nome"" = EXCLUDED.""Nome""; ""Cargo"" = EXCLUDED.""Cargo""; ""Cargo"" = EXCLUDED.""Ordem"";";
-
-                await using var insertUpdateTarjaCmd = new NpgsqlCommand(insertUpdateTarjaSql, conn, transaction);
-                insertUpdateTarjaCmd.Parameters.Add("roId", NpgsqlTypes.NpgsqlDbType.Text);
-                insertUpdateTarjaCmd.Parameters.Add("Identificador", NpgsqlTypes.NpgsqlDbType.Text);
-                insertUpdateTarjaCmd.Parameters.Add("Manchete", NpgsqlTypes.NpgsqlDbType.Text);
-                insertUpdateTarjaCmd.Parameters.Add("Linha1", NpgsqlTypes.NpgsqlDbType.Text);
-                insertUpdateTarjaCmd.Parameters.Add("Linha2", NpgsqlTypes.NpgsqlDbType.Text);
-                insertUpdateTarjaCmd.Parameters.Add("Ordem", NpgsqlTypes.NpgsqlDbType.Integer);
-
-
-                var matches = Regex.Matches(conteudoCompleto, @"\[CG\s*:(.*?)\]");
-
-                int ordemC = 0;
-                int ordemT = 0;
-                foreach (Match match in matches)
-                {
-                    string conteudo = match.Groups[1].Value;
-                    var partes = conteudo.Split('\\');
-                    if (partes[0] == "CREDITO_NEWS_VMIX_2025")
+                    // Tentar processar 1..N mensagens completas presentes no buffer
+                    bool loop = true;
+                    while (loop)
                     {
-                        insertCreditoCmd.Parameters["roId"].Value = storyID;
-                        insertCreditoCmd.Parameters["Identificador"].Value = storyID;
-                        insertCreditoCmd.Parameters["Nome"].Value = partes[1];
-                        insertCreditoCmd.Parameters["Cargo"].Value = partes[2];
-                        insertCreditoCmd.Parameters["Ordem"].Value = ordemC++;
-
-                        await insertCreditoCmd.ExecuteNonQueryAsync();
-                    }
-                    if (partes[0] == "TARJA_NEWS_VMIX_2025")
-                    {
-                        insertUpdateTarjaCmd.Parameters["roId"].Value = storyID;
-                        insertUpdateTarjaCmd.Parameters["Identificador"].Value = storyID;
-                        insertUpdateTarjaCmd.Parameters["Manchete"].Value = partes[1];
-                        insertUpdateTarjaCmd.Parameters["Linha1"].Value = partes[2];
-                        insertUpdateTarjaCmd.Parameters["Linha2"].Value = partes[3];
-                        insertUpdateTarjaCmd.Parameters["Ordem"].Value = ordemT++;
-
-                        await insertUpdateTarjaCmd.ExecuteNonQueryAsync();
-                    }
-                }
-            }
-
-            await transaction.CommitAsync();
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine(e.ToString());
-            await transaction.RollbackAsync();
-            throw;
-        }
-    }
-
-    public async Task UpdateOrdemroElementAction(XElement item)
-    {
-        var storyIdTarget = item.Element("element_target").Element("storyID").Value ?? "";
-        var storyIdSource = item.Element("element_source").Element("storyID").Value ?? "";
-        var roID = item.Element("roID").Value ?? "";
-        //if (string.IsNullOrEmpty(roID))
-        //    roID = storyID.Substring(0, storyID.LastIndexOf(';'));
-
-        await using var conn = new NpgsqlConnection(cnPG);
-        await conn.OpenAsync();
-        await using var tx = await conn.BeginTransactionAsync();
-
-        var getOrderSql = @"SELECT ""Ordem"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @id";
-
-        int ordemTarget, ordemSource;
-
-        await using (var cmd = new NpgsqlCommand(getOrderSql, conn, tx))
-        {
-            cmd.Parameters.AddWithValue("id", storyIdTarget);
-            ordemTarget = Convert.ToInt32(await cmd.ExecuteScalarAsync());
-        }
-
-        //await using (var cmd = new NpgsqlCommand(getOrderSql, conn, tx))
-        //{
-        //    cmd.Parameters.AddWithValue("id", storyIdSource);
-        //    ordemSource = Convert.ToInt32(await cmd.ExecuteScalarAsync());
-        //}
-
-        var updateSql = @"UPDATE ""MOS"".""Stories"" SET ""Ordem"" = @ordem WHERE ""roId"" = @storyID";
-        await using (var cmd = new NpgsqlCommand(updateSql, conn, tx))
-        {
-            cmd.Parameters.AddWithValue("ordem", ordemTarget + 1);
-            cmd.Parameters.AddWithValue("storyID", storyIdTarget);
-            var _ = await cmd.ExecuteNonQueryAsync();
-            Console.WriteLine(_);
-        }
-
-        await using (var cmd = new NpgsqlCommand(updateSql, conn, tx))
-        {
-            cmd.Parameters.AddWithValue("ordem", ordemTarget);
-            cmd.Parameters.AddWithValue("storyID", storyIdSource);
-            var _ = await cmd.ExecuteNonQueryAsync();
-            Console.WriteLine(_);
-        }
-
-
-        //const string updateOrdemAllsql = @"update ""MOS"".""Stories"" set ""Ordem"" = ""Ordem"" + 1 where ""Ordem"" >= (SELECT ""Ordem"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId)
-        //    and ""RundownId"" = (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1)";
-        //await using (var cmd = new NpgsqlCommand(updateOrdemAllsql, conn, tx))
-        //{
-        //    cmd.Parameters.AddWithValue("RundownId", roID);
-        //    cmd.Parameters.AddWithValue("roId", storyIdSource);
-
-        //    var x = await cmd.ExecuteNonQueryAsync();
-        //    Console.WriteLine(x);
-        //}
-
-        await tx.CommitAsync();
-    }
-
-    public async Task InsertroElementAction(XElement item)
-    {
-        //return;
-        await using var conn = new NpgsqlConnection(cnPG);
-        await conn.OpenAsync();
-
-        // Criar uma transação para garantir atomicidade
-        await using var transaction = await conn.BeginTransactionAsync();
-
-        try
-        {
-            var roId = item.Element("roID")?.Value ?? "";
-            
-            var storyID = item.Element("element_source").Element("story").Element("storyID")?.Value ?? "";
-            var storySlug = item.Element("element_source").Element("story").Element("storySlug")?.Value ?? "";
-            var storyIDOrdem = item.Element("element_target").Element("storyID")?.Value ?? "";
-            int ordemTarget = 1;
-
-            // inserir ocupando a posicao do anterior
-            var insertStorySql = @"INSERT INTO ""MOS"".""Stories"" (""RundownId"", ""roId"", ""Identificador"", ""Titulo"", ""Ordem"") 
-                VALUES ((SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1), @roId, @Identificador, @Titulo, @Ordem) 
-                ON CONFLICT (""roId"") DO NOTHING RETURNING ""Id"";";
-
-            if (string.IsNullOrEmpty(storyIDOrdem))
-            {
-                insertStorySql = @"INSERT INTO ""MOS"".""Stories"" (""RundownId"", ""roId"", ""Identificador"", ""Titulo"", ""Ordem"") 
-                VALUES ((SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1), @roId, @Identificador, @Titulo, 
-                COALESCE((SELECT MAX(""Ordem"") + 1 FROM ""MOS"".""Stories"" WHERE ""RundownId"" = 
-                (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1)),1)) ON CONFLICT (""roId"") DO NOTHING RETURNING ""Id"";";
-            }           
-            else
-            {
-                var getOrderSql = @"SELECT ""Ordem"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @id";
-
-                await using (var cmd = new NpgsqlCommand(getOrderSql, conn, transaction))
-                {
-                    cmd.Parameters.AddWithValue("id", storyIDOrdem);
-                    ordemTarget = Convert.ToInt32(await cmd.ExecuteScalarAsync());
-                }
-
-                //const string updateOrdemAllsql = @"update ""MOS"".""Stories"" set ""Ordem"" = ""Ordem"" + 1 where ""roId"" = @roId";
-                //await using var updateOrdemAllCmd = new NpgsqlCommand(updateOrdemAllsql, conn, transaction);
-                //updateOrdemAllCmd.Parameters.Add("roId", NpgsqlTypes.NpgsqlDbType.Text);
-                //updateOrdemAllCmd.Parameters["roId"].Value = storyIDOrdem;
-
-                //var _ = await updateOrdemAllCmd.ExecuteNonQueryAsync();
-                //Console.WriteLine(_);
-
-                const string updateOrdemAllsql = @"update ""MOS"".""Stories"" set ""Ordem"" = ""Ordem"" + 1 where ""Ordem"" >= @ordemTarget
-                and ""RundownId"" = (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1)";
-                await using (var cmd = new NpgsqlCommand(updateOrdemAllsql, conn, transaction))
-                {
-                    cmd.Parameters.Add("RundownId", NpgsqlTypes.NpgsqlDbType.Text);
-                    cmd.Parameters["RundownId"].Value = roId;
-                    cmd.Parameters.Add("ordemTarget", NpgsqlTypes.NpgsqlDbType.Integer);
-                    cmd.Parameters["ordemTarget"].Value = ordemTarget;
-
-                    var _ = await cmd.ExecuteNonQueryAsync();
-                    //Console.WriteLine("atualizados: " + _);
-                }
-            }
-
-            await using (var cmd = new NpgsqlCommand(insertStorySql, conn, transaction))
-            {
-                cmd.Parameters.Add("RundownId", NpgsqlTypes.NpgsqlDbType.Text);
-                cmd.Parameters.Add("roId", NpgsqlTypes.NpgsqlDbType.Text);
-                //insertStoryCmd.Parameters.Add("id", NpgsqlTypes.NpgsqlDbType.Text);
-                cmd.Parameters.Add("Identificador", NpgsqlTypes.NpgsqlDbType.Text);
-                cmd.Parameters.Add("Titulo", NpgsqlTypes.NpgsqlDbType.Text);
-                cmd.Parameters.Add("Ordem", NpgsqlTypes.NpgsqlDbType.Integer);
-
-                cmd.Parameters["RundownId"].Value = roId;
-                cmd.Parameters["roId"].Value = storyID;
-                //insertStoryCmd.Parameters["id"].Value = storyIDOrdem;
-                cmd.Parameters["Identificador"].Value = Guid.NewGuid().ToString();
-                cmd.Parameters["Titulo"].Value = storySlug;
-                cmd.Parameters["Ordem"].Value = ordemTarget;
-
-                var __ = await cmd.ExecuteNonQueryAsync();
-                //Console.WriteLine("adicionado: " + __);
-            }
-
-            if (1 == 2)
-            {
-                if (!string.IsNullOrEmpty(storyIDOrdem))
-                {
-                    //const string updateOrdemAllsql = @"update ""MOS"".""Stories"" set ""Ordem"" = ""Ordem"" + 1 where ""roId"" = @roId";
-                    //await using var updateOrdemAllCmd = new NpgsqlCommand(updateOrdemAllsql, conn, transaction);
-                    ////updateOrdemAllCmd.Parameters.Add("RundownId", NpgsqlTypes.NpgsqlDbType.Text);
-                    ////updateOrdemAllCmd.Parameters["RundownId"].Value = roId;
-                    //updateOrdemAllCmd.Parameters.Add("roId", NpgsqlTypes.NpgsqlDbType.Text);
-                    //updateOrdemAllCmd.Parameters["roId"].Value = storyID;
-                    ////updateOrdemAllCmd.Parameters.Add("id", NpgsqlTypes.NpgsqlDbType.Text);
-                    ////updateOrdemAllCmd.Parameters["id"].Value = storyIDOrdem;
-
-                    //var _ = await updateOrdemAllCmd.ExecuteNonQueryAsync();
-                    //Console.WriteLine(_);
-                }
-            }
-            
-            if (! string.IsNullOrEmpty(storyIDOrdem))
-            {
-                //return;
-                //const string updateOrdemAllsql = @"update ""MOS"".""Stories"" set ""Ordem"" = ""Ordem"" + 1 where ""Ordem"" >= (SELECT ""Ordem"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @id)
-                //and ""roId"" <> @roId and ""RundownId"" = (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1)";
-                //await using var updateOrdemAllCmd = new NpgsqlCommand(updateOrdemAllsql, conn, transaction);
-                //updateOrdemAllCmd.Parameters.Add("RundownId", NpgsqlTypes.NpgsqlDbType.Text);
-                //updateOrdemAllCmd.Parameters["RundownId"].Value = roId;
-                //updateOrdemAllCmd.Parameters.Add("roId", NpgsqlTypes.NpgsqlDbType.Text);
-                //updateOrdemAllCmd.Parameters["roId"].Value = storyID;
-                //updateOrdemAllCmd.Parameters.Add("id", NpgsqlTypes.NpgsqlDbType.Text);
-                //updateOrdemAllCmd.Parameters["id"].Value = storyIDOrdem;
-
-                //var _ = await updateOrdemAllCmd.ExecuteNonQueryAsync();
-                //Console.WriteLine(_);
-            }
-
-            await transaction.CommitAsync();
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine("sql error: " + ex.Message.ToString());
-            await transaction.RollbackAsync();
-            throw;
-        }
-    }
-
-    public async Task UpdateStorySlugroElementAction(XElement item)
-    {
-        //return;
-        await using var conn = new NpgsqlConnection(cnPG);
-        await conn.OpenAsync();
-
-        // Criar uma transação para garantir atomicidade
-        await using var transaction = await conn.BeginTransactionAsync();
-
-        try
-        {
-            var roId = item.Element("roID")?.Value ?? "";
-            var storyID = item.Element("element_source").Element("story").Element("storyID")?.Value ?? "";
-            var storySlug = item.Element("element_source").Element("story").Element("storySlug")?.Value ?? "";
-            const string insertStorySql = @"update ""MOS"".""Stories"" set ""Titulo"" = @Titulo where ""roId"" = @roId;";
-
-            await using var insertStoryCmd = new NpgsqlCommand(insertStorySql, conn, transaction);
-            insertStoryCmd.Parameters.Add("roId", NpgsqlTypes.NpgsqlDbType.Text);
-            insertStoryCmd.Parameters.Add("Titulo", NpgsqlTypes.NpgsqlDbType.Text);
-
-            insertStoryCmd.Parameters["roId"].Value = storyID;
-            insertStoryCmd.Parameters["Titulo"].Value = storySlug;
-
-            await insertStoryCmd.ExecuteNonQueryAsync();
-
-            await transaction.CommitAsync();
-        }
-        catch
-        {
-            await transaction.RollbackAsync();
-            throw;
-        }
-    }    
-
-    public async Task DeleteroElementAction(XElement item)
-    {
-        await using var conn = new NpgsqlConnection(cnPG);
-        await conn.OpenAsync();
-
-        await using var transaction = await conn.BeginTransactionAsync();
-        try
-        {
-            var storyID = item.Element("element_source").Element("storyID").Value ?? "";
-            var roID = item.Element("roID").Value ?? "";
-            if (string.IsNullOrEmpty(roID))
-                roID = storyID.Substring(0, storyID.LastIndexOf(';'));
-
-            const string deleteStoriesCreditoSql = @"DELETE FROM ""MOS"".""StoryCreditos"" WHERE ""StoryId"" IN
-                (SELECT ""Id"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId LIMIT 1);";
-
-            await using (var cmd = new NpgsqlCommand(deleteStoriesCreditoSql, conn, transaction))
-            {
-                cmd.Parameters.AddWithValue("roId", storyID);
-                await cmd.ExecuteNonQueryAsync();
-            }            
-
-            const string deleteStoriesTarjaSql = @"DELETE FROM ""MOS"".""StoryTarjas"" WHERE ""StoryId"" IN
-                (SELECT ""Id"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId LIMIT 1);";
-
-            await using (var cmd = new NpgsqlCommand(deleteStoriesTarjaSql, conn, transaction))
-            {
-                cmd.Parameters.AddWithValue("roID", storyID);
-                await cmd.ExecuteNonQueryAsync();
-            }
-
-            const string updateOrdemAllsql = @"update ""MOS"".""Stories"" set ""Ordem"" = ""Ordem"" - 1 where ""Ordem"" >= (SELECT ""Ordem"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId)
-            and ""RundownId"" = (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1)";
-            await using (var cmd = new NpgsqlCommand(updateOrdemAllsql, conn, transaction))
-            {
-                cmd.Parameters.AddWithValue("RundownId", roID);
-                cmd.Parameters.AddWithValue("roId", storyID);
-
-                var x = await cmd.ExecuteNonQueryAsync();
-            }
-
-            const string deleteStoriesSql = @"DELETE FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId;";
-
-            await using (var cmd = new NpgsqlCommand(deleteStoriesSql, conn, transaction))
-            {
-                cmd.Parameters.AddWithValue("roID", storyID);
-                await cmd.ExecuteNonQueryAsync();
-            }
-
-            await transaction.CommitAsync();
-        }
-        catch
-        {
-            await transaction.RollbackAsync();
-            throw;
-        }
-    }
-
-    public async Task RemoveRoDelete(string identificador)
-    {
-        await using var conn = new NpgsqlConnection(cnPG);
-        await conn.OpenAsync();
-
-        await using var transaction = await conn.BeginTransactionAsync();
-        try
-        {
-            const string deleteStoriesCreditoSql = @"DELETE FROM ""MOS"".""StoryCreditos"" WHERE ""StoryId"" IN
-                (SELECT ""Id"" FROM ""MOS"".""Stories"" WHERE ""RundownId"" = 
-                (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @Identificador LIMIT 1));";
-
-            await using (var cmd = new NpgsqlCommand(deleteStoriesCreditoSql, conn, transaction))
-            {
-                cmd.Parameters.AddWithValue("Identificador", identificador);
-                await cmd.ExecuteNonQueryAsync();
-            }
-
-            const string deleteStoriesTarjaSql = @"DELETE FROM ""MOS"".""StoryTarjas"" WHERE ""StoryId"" IN
-                (SELECT ""Id"" FROM ""MOS"".""Stories"" WHERE ""RundownId"" = 
-                (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @Identificador LIMIT 1));";
-
-            await using (var cmd = new NpgsqlCommand(deleteStoriesTarjaSql, conn, transaction))
-            {
-                cmd.Parameters.AddWithValue("Identificador", identificador);
-                await cmd.ExecuteNonQueryAsync();
-            }
-
-            const string deleteStoriesSql = @"DELETE FROM ""MOS"".""Stories"" WHERE ""RundownId"" = (
-                SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @Identificador LIMIT 1);";
-
-            await using (var cmd = new NpgsqlCommand(deleteStoriesSql, conn, transaction))
-            {
-                cmd.Parameters.AddWithValue("Identificador", identificador);
-                await cmd.ExecuteNonQueryAsync();
-            }
-
-            const string deleteRundownSql = @"DELETE FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @Identificador;";
-
-            await using (var cmd = new NpgsqlCommand(deleteRundownSql, conn, transaction))
-            {
-                cmd.Parameters.AddWithValue("Identificador", identificador);
-                await cmd.ExecuteNonQueryAsync();
-            }
-
-            await transaction.CommitAsync();
-        }
-        catch
-        {
-            await transaction.RollbackAsync();
-            throw;
-        }
-    }
-
-    public async Task EnviarRoReqAllAsync(string host, int porta, string roID)
-    {
-        Console.WriteLine("====== iniciio requisicao reqAll");
-        // Monta o XML
-        //var xml = new XElement("roReqAll",
-        //    new XElement("roID", roID)
-        //).ToString(SaveOptions.DisableFormatting);
-
-        //// MOS usa mensagens com \r\n no final
-        //var mensagem = xml + "\r\n";
-
-        var xml = new XElement("mos",
-            new XElement("mosID", mosId),
-            new XElement("ncsID", ncsID),
-            new XElement("messageID", Guid.NewGuid().ToString()), // ou contador próprio
-            new XElement("roReqAll", new XElement("roID", roID)
-            )
-        ).ToString(SaveOptions.DisableFormatting);
-
-        var mensagem = xml + "\r\n";
-
-        // Conecta ao MOS
-        using var client = new TcpClient();
-        await client.ConnectAsync(host, porta);
-
-        using var stream = client.GetStream();
-        var buffer = Encoding.UTF8.GetBytes(mensagem);
-
-        // Envia
-        await stream.WriteAsync(buffer, 0, buffer.Length);
-        await stream.FlushAsync();
-
-        Console.WriteLine("======== fim requisicao reqAll");
-    }
-
-    //public Models.Crawl getLast(string Tipo)
-    //{
-    //    Connect();
-    //    using var cmd = new NpgsqlCommand("select \"Id\", \"Identificador\", \"Tipo\", \"Titulo\", \"DataHora\", \"DataHoraAtualizacao\", \"Status\", \"Content\" "
-    //        + "from \"Crawl\".\"Logs\" where \"Tipo\" = $1 order by \"Id\" Desc Limit 1", conn)
-    //    { Parameters = { new() { Value = Tipo } } };
-
-    //    using var reader = cmd.ExecuteReader();
-
-    //    Models.Crawl log = null;
-
-    //    if (reader != null)
-    //    {
-    //        log = new Models.Crawl();
-    //        while (reader.Read())
-    //        {
-    //            log.Id = reader.GetInt32(0);
-    //            log.Identificador = reader.GetInt32(1);
-    //            log.Tipo = reader.GetString(2);
-    //            log.Titulo = reader.GetString(3);
-    //            log.DataHora = reader.GetDateTime(4);
-    //            log.DataHoraAtualizacao = reader.GetDateTime(5);
-    //            log.Status = reader.GetString(6);
-    //            log.Content = reader.GetString(7);
-    //        }
-    //        Disconnect();
-    //        return log;
-    //    }
-
-    //    Disconnect();
-    //    return log;
-    //}
-}
-
-class Program
-{
-    static readonly int[] PORTS = { 10540, 10541 };
-    public static Dados dados = new Dados();
-    static JsonDocument doc = null;
-
-    static async Task Main()
-    {
-        //await dados.EnviarRoReqAllAsync("172.16.2.31", 10540, "SRV-013-ENPS01;P_VIDEOGRA\\\\W;03E069B0-3FC3-4935-90163EDE3207D163");
-
-        foreach (var p in PORTS) StartServer(p);
-        Console.WriteLine("Servidor MOS rodando...");
-        await Task.Delay(-1);
-    }
-
-    static async Task Main_(string[] args)
-    {
-        string mosServerIP = "172.16.2.31"; // IP do servidor MOS
-        int mosServerPort = 10540; // Porta TCP do MOS
-        string localMosID = "VMIX.MOS"; // Seu ID MOS
-        string remoteMosID = "SRV-013-ENPS01"; // ID do servidor MOS
-
-        // Montar XML do roReqAll (com MOS IDs)
-        string roReqAllXml =
-            $@"<mos>
-                <mosID>{localMosID}</mosID>
-                <ncsID>{remoteMosID}</ncsID>
-                <roReqAll/>
-            </mos>";
-
-        try
-        {
-            using TcpClient client = new TcpClient();
-            Console.WriteLine($"Conectando ao servidor MOS {mosServerIP}:{mosServerPort}...");
-            await client.ConnectAsync(mosServerIP, mosServerPort);
-
-            using NetworkStream stream = client.GetStream();
-            byte[] dataToSend = Encoding.UTF8.GetBytes(roReqAllXml);
-
-            Console.WriteLine("Enviando roReqAll...");
-            await stream.WriteAsync(dataToSend, 0, dataToSend.Length);
-
-            // Ler resposta
-            byte[] buffer = new byte[4096];
-            int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
-            string response = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-
-            Console.WriteLine("Resposta recebida:");
-            Console.WriteLine(response);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Erro: {ex.Message}");
-        }
-    }
-
-    static void StartServer(int port)
-    {
-        LoadPrograms();
-
-        var listener = new TcpListener(IPAddress.Any, port);
-        listener.Start();
-        Console.WriteLine($"Escutando na porta {port}");
-        _ = Task.Run(async () =>
-        {
-            while (true)
-            {
-                var client = await listener.AcceptTcpClientAsync();
-                _ = HandleClient(client, port);
-            }
-        });
-    }
-
-    static async Task LoadPrograms()
-    {
-        using var http = new HttpClient();
-        string url = "http://172.16.1.140:3000/api/programas/tarjasenews";
-        string json = await http.GetStringAsync(url);
-
-        doc = JsonDocument.Parse(json);
-    }
-
-    static int getProgram(string identificador)
-    {
-        string identificador_ = identificador.Split(';')[1].Split('\\')[0];
-        int program = 0;
-
-        foreach (var item in doc.RootElement.GetProperty("itens").EnumerateArray())
-        {
-            if (item.TryGetProperty("IdentificadorMOS", out var mosProp))
-            {
-                if (mosProp.GetString() == identificador_)
-                {
-                    return item.GetProperty("Id").GetInt32();
-                }
-            }
-        }
-
-        return program;
-    }
-    
-    static async Task HandleClient(TcpClient client, int port)
-    {
-        var endpoint = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
-        Console.WriteLine($"Conexão recebida de {endpoint} na porta {port}");
-
-        var stream = client.GetStream();
-        var bufferList = new List<byte>();
-        var readBuffer = new byte[4096];
-
-        try
-        {
-            while (true)
-            {
-                int n = await stream.ReadAsync(readBuffer, 0, readBuffer.Length);
-                if (n == 0) break; // conexão fechada
-
-                // Append bytes recebidos ao buffer
-                for (int i = 0; i < n; i++) bufferList.Add(readBuffer[i]);
-
-                // Tentar processar 1..N mensagens completas presentes no buffer
-                bool loop = true;
-                while (loop)
-                {
-                    loop = false;
-                    if (bufferList.Count < 2) break; // nada suficiente ainda
-
-                    // Detecta encoding com base no conteúdo atual do buffer
-                    var bytesArray = bufferList.ToArray();
-                    var encoding = DetectEncoding(bytesArray);
-
-                    // Se for UTF-16 (LE/BE), precisamos de número par de bytes para decodificar corretamente
-                    if ((encoding == Encoding.Unicode || encoding == Encoding.BigEndianUnicode) && (bufferList.Count % 2 != 0))
-                    {
-                        // aguarda mais bytes
-                        break;
-                    }
-
-                    // Offset para pular BOM caso exista (2 bytes)
-                    int bomOffset = 0;
-                    if (bytesArray.Length >= 2)
-                    {
-                        if (bytesArray[0] == 0xFF && bytesArray[1] == 0xFE) bomOffset = 2; // UTF-16LE BOM
-                        else if (bytesArray[0] == 0xFE && bytesArray[1] == 0xFF) bomOffset = 2; // UTF-16BE BOM
-                        else if (bytesArray.Length >= 3 && bytesArray[0] == 0xEF && bytesArray[1] == 0xBB && bytesArray[2] == 0xBF) bomOffset = 3; // UTF-8 BOM
-                    }
-
-                    // Trabalha com uma cópia "útil" sem o BOM inicial
-                    var usable = bytesArray.Skip(bomOffset).ToArray();
-                    string messageCandidate;
-                    try
-                    {
-                        messageCandidate = encoding.GetString(usable);
-                    }
-                    catch
-                    {
-                        // fallback para UTF-8 se houver problema
-                        messageCandidate = Encoding.UTF8.GetString(usable);
-                        encoding = Encoding.UTF8;
-                    }
-
-                    // Remove eventual BOM char Unicode (U+FEFF) e trim
-                    messageCandidate = messageCandidate.TrimStart('\uFEFF').Trim();
-                    messageCandidate = Regex.Replace(
-                        messageCandidate, @"^[\s\S]*?(<mos\b)", "$1", RegexOptions.IgnoreCase);
-
-                    // Procurar por fechamento de mensagem MOS
-                    int endIdx = messageCandidate.IndexOf("</mos>", StringComparison.Ordinal);
-                    if (endIdx == -1)
-                    {
-                        // Não há mensagem completa ainda → aguarda mais bytes
-                        break;
-                    }
-
-                    // Temos pelo menos uma mensagem completa
-                    int inclusive = endIdx + "</mos>".Length;                    
-                    
-                    string xmlString = messageCandidate.Substring(0, inclusive);
-
-                    // Parse e tratamento
-                    try
-                    {
-                        //dados.addLog(new Models.Log() { Message = xmlString });
-                        await dados.AddLogAsync(new Models.Log { Message = xmlString });
-
-                        var doc = XDocument.Parse(xmlString);
-                        //Console.WriteLine($"============================\n{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss ")}" + $"\n============================\nXML parseado:\n" + xmlString);
-                        Console.WriteLine($"============================\n{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss ")}" + $"\n============================");
-                        string roId = "";
-
-                        //ok
-                        var roCreate = doc.Root.Element("roCreate");
-                        if (roCreate != null)
+                        loop = false;
+                        if (bufferList.Count < 2) break; // nada suficiente ainda
+
+                        // Detecta encoding com base no conteúdo atual do buffer
+                        var bytesArray = bufferList.ToArray();
+                        var encoding = DetectEncoding(bytesArray);
+
+                        // Se for UTF-16 (LE/BE), precisamos de número par de bytes para decodificar corretamente
+                        if ((encoding == Encoding.Unicode || encoding == Encoding.BigEndianUnicode) && (bufferList.Count % 2 != 0))
                         {
-                            roId = roCreate.Element("roID")?.Value ?? "";
-                            dados.idEmpresa = getProgram(roId.ToString());
-                            Console.WriteLine("roCreate identificado: " + roId);
-                            await dados.AddRoCreate(roCreate);
+                            // aguarda mais bytes
+                            break;
                         }
 
-                        //ok
-                        var roStorySend = doc.Root.Element("roStorySend");
-                        if (roStorySend != null)
+                        // Offset para pular BOM caso exista (2 bytes)
+                        int bomOffset = 0;
+                        if (bytesArray.Length >= 2)
                         {
-                            roId = roStorySend.Element("roID")?.Value ?? "";
-                            var storyID = roStorySend.Element("storyID")?.Value ?? "";
-                            var storySlug = roStorySend.Element("storySlug")?.Value ?? "";
-                            //Console.WriteLine("roStorySend identificado: " + roId);
-                            //Console.WriteLine("storyID identificado: " + storyID);
-                            //Console.WriteLine("storySlug identificado: " + storySlug);
-                            var conteudoCompleto = roStorySend.Element("storyBody")?.Value ?? "";
-                            //Console.WriteLine("storyBody : " + conteudoCompleto);
-
-                            //var matches = Regex.Matches(conteudoCompleto, @"\[CG\s*:(.*?)\]");
-
-                            //foreach (Match match in matches)
-                            //{
-                            //    string conteudo = match.Groups[1].Value; // tudo que estava dentro
-                            //    Console.WriteLine($"Capturado: {conteudo}");
-                            //    // Se quiser fazer split por barra invertida '\'
-                            //    var partes = conteudo.Split('\\');
-                            //    Console.WriteLine("Partes:");
-                            //    foreach (var p in partes)
-                            //    {
-                            //        Console.WriteLine($" - {p}");
-                            //    }
-                            //    //Console.WriteLine();
-                            //}
-
-                            await dados.AddRoStorySend(roStorySend);                            
-
-                            // Se quiser apenas o conteúdo interno (sem a tag <roStorySend>)
-                            //string conteudoInterno = string.Concat(roStorySend.Elements());
-                            //Console.WriteLine(conteudoInterno);
-                        }                        
-
-                        //ok, nada a fazer
-                        var roReadyToAir = doc.Root.Element("roReadyToAir");
-                        if (roReadyToAir != null)
-                        {
-                            roId = roReadyToAir.Element("roID")?.Value ?? "";
-                            Console.WriteLine("roReadyToAir identificado: " + roId);
+                            if (bytesArray[0] == 0xFF && bytesArray[1] == 0xFE) bomOffset = 2; // UTF-16LE BOM
+                            else if (bytesArray[0] == 0xFE && bytesArray[1] == 0xFF) bomOffset = 2; // UTF-16BE BOM
+                            else if (bytesArray.Length >= 3 && bytesArray[0] == 0xEF && bytesArray[1] == 0xBB && bytesArray[2] == 0xBF) bomOffset = 3; // UTF-8 BOM
                         }
 
-                        //ok
-                        var roDelete = doc.Root.Element("roDelete");
-                        if (roDelete != null)
+                        // Trabalha com uma cópia "útil" sem o BOM inicial
+                        var usable = bytesArray.Skip(bomOffset).ToArray();
+                        string messageCandidate;
+                        try
                         {
-                            roId = roDelete.Element("roID")?.Value ?? "";
-                            Console.WriteLine("roDelete identificado: " + roId);
-                            await dados.RemoveRoDelete(roId);
+                            messageCandidate = encoding.GetString(usable);
+                        }
+                        catch
+                        {
+                            // fallback para UTF-8 se houver problema
+                            messageCandidate = Encoding.UTF8.GetString(usable);
+                            encoding = Encoding.UTF8;
                         }
 
-                        //ok, nada a fazer
-                        var roReq = doc.Root.Element("roReq");
-                        if (roReq != null)
+                        // Remove eventual BOM char Unicode (U+FEFF) e trim
+                        messageCandidate = messageCandidate.TrimStart('\uFEFF').Trim();
+                        messageCandidate = Regex.Replace(
+                            messageCandidate, @"^[\s\S]*?(<mos\b)", "$1", RegexOptions.IgnoreCase);
+
+                        // Procurar por fechamento de mensagem MOS
+                        int endIdx = messageCandidate.IndexOf("</mos>", StringComparison.Ordinal);
+                        if (endIdx == -1)
                         {
-                            roId = roReq.Element("roID")?.Value ?? "";
-                            Console.WriteLine("roReq identificado: " + roId);
+                            // Não há mensagem completa ainda → aguarda mais bytes
+                            break;
                         }
 
-                        // implementando ...
-                        var roElementAction = doc.Root.Element("roElementAction");
-                        if (roElementAction != null)
+                        // Temos pelo menos uma mensagem completa
+                        int inclusive = endIdx + "</mos>".Length;
+
+                        string xmlString = messageCandidate.Substring(0, inclusive);
+
+                        // Parse e tratamento
+                        try
                         {
-                            roId = roElementAction.Element("roID")?.Value ?? "";
-                            Console.WriteLine("roElementAction identificado: " + roId);
-                            if ((roElementAction.Attribute("operation")?.Value ?? "") == "INSERT")
+                            //dados.addLog(new Models.Log() { Message = xmlString });
+                            if (xmlString == "</mos>") throw new Exception("ACK");
+
+                            await dados.AddLogAsync(new Models.Log { Message = xmlString });
+
+                            var doc = XDocument.Parse(xmlString);
+                            //Console.WriteLine($"============================\n{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss ")}" + $"\n============================\nXML parseado:\n" + xmlString);
+                            Console.WriteLine($"============================\n{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss ")}" + $"\n============================");
+                            string roId = "";
+
+                            //ok
+                            var roCreate = doc.Root.Element("roCreate");
+                            if (roCreate != null)
                             {
-                                Console.WriteLine("add story");
-                                await dados.InsertroElementAction(roElementAction);
+                                roId = roCreate.Element("roID")?.Value ?? "";
+                                dados.idEmpresa = getProgram(roId.ToString());
+                                Console.WriteLine("roCreate identificado: " + roId);
+                                await dados.AddRoCreate(roCreate);
                             }
 
-                            if ((roElementAction.Attribute("operation")?.Value ?? "") == "REPLACE")
+                            //ok
+                            var roStorySend = doc.Root.Element("roStorySend");
+                            if (roStorySend != null)
                             {
-                                Console.WriteLine("update story");
-                                await dados.UpdateStorySlugroElementAction(roElementAction);
-                            }                            
+                                roId = roStorySend.Element("roID")?.Value ?? "";
+                                var storyID = roStorySend.Element("storyID")?.Value ?? "";
+                                var storySlug = roStorySend.Element("storySlug")?.Value ?? "";
+                                //Console.WriteLine("roStorySend identificado: " + roId);
+                                //Console.WriteLine("storyID identificado: " + storyID);
+                                //Console.WriteLine("storySlug identificado: " + storySlug);
+                                var conteudoCompleto = roStorySend.Element("storyBody")?.Value ?? "";
+                                //Console.WriteLine("storyBody : " + conteudoCompleto);
 
-                            if ((roElementAction.Attribute("operation")?.Value ?? "") == "MOVE")
-                            {
-                                Console.WriteLine("move story");
-                                await dados.UpdateOrdemroElementAction(roElementAction);
+                                //var matches = Regex.Matches(conteudoCompleto, @"\[CG\s*:(.*?)\]");
+
+                                //foreach (Match match in matches)
+                                //{
+                                //    string conteudo = match.Groups[1].Value; // tudo que estava dentro
+                                //    Console.WriteLine($"Capturado: {conteudo}");
+                                //    // Se quiser fazer split por barra invertida '\'
+                                //    var partes = conteudo.Split('\\');
+                                //    Console.WriteLine("Partes:");
+                                //    foreach (var p in partes)
+                                //    {
+                                //        Console.WriteLine($" - {p}");
+                                //    }
+                                //    //Console.WriteLine();
+                                //}
+
+                                await dados.AddRoStorySend(roStorySend);
+
+                                // Se quiser apenas o conteúdo interno (sem a tag <roStorySend>)
+                                //string conteudoInterno = string.Concat(roStorySend.Elements());
+                                //Console.WriteLine(conteudoInterno);
                             }
-                            if ((roElementAction.Attribute("operation")?.Value ?? "") == "DELETE")
+
+                            //ok, nada a fazer
+                            var roReadyToAir = doc.Root.Element("roReadyToAir");
+                            if (roReadyToAir != null)
                             {
-                                Console.WriteLine("apaga story");
-                                await dados.DeleteroElementAction(roElementAction);
+                                roId = roReadyToAir.Element("roID")?.Value ?? "";
+                                Console.WriteLine("roReadyToAir identificado: " + roId);
                             }
-                            //string ack = $"<mos><roAck><roID>{EscapeXml(roId)}</roID><roStatus>OK</roStatus></roAck></mos>";
-                            //await SendResponse(stream, ack, encoding);
+
+                            //ok
+                            var roDelete = doc.Root.Element("roDelete");
+                            if (roDelete != null)
+                            {
+                                roId = roDelete.Element("roID")?.Value ?? "";
+                                Console.WriteLine("roDelete identificado: " + roId);
+                                await dados.RemoveRoDelete(roId);
+                            }
+
+                            //ok, nada a fazer
+                            var roReq = doc.Root.Element("roReq");
+                            if (roReq != null)
+                            {
+                                roId = roReq.Element("roID")?.Value ?? "";
+                                Console.WriteLine("roReq identificado: " + roId);
+                            }
+
+                            // implementando ...
+                            var roElementAction = doc.Root.Element("roElementAction");
+                            if (roElementAction != null)
+                            {
+                                roId = roElementAction.Element("roID")?.Value ?? "";
+                                Console.WriteLine("roElementAction identificado: " + roId);
+                                if ((roElementAction.Attribute("operation")?.Value ?? "") == "INSERT")
+                                {
+                                    Console.WriteLine("add story");
+                                    await dados.InsertroElementAction(roElementAction);
+                                }
+
+                                if ((roElementAction.Attribute("operation")?.Value ?? "") == "REPLACE")
+                                {
+                                    Console.WriteLine("update story");
+                                    await dados.UpdateStorySlugroElementAction(roElementAction);
+                                }
+
+                                if ((roElementAction.Attribute("operation")?.Value ?? "") == "MOVE")
+                                {
+                                    Console.WriteLine("move story");
+                                    await dados.UpdateOrdemroElementAction(roElementAction);
+                                    //_ = dados.EnviarRoReqAllAsync(mosServerIP, 10541, roId);
+                                    //_ = EnviarRoReqAll(stream);
+                                    //_ = EnviarRoReqAllAsync(stream, localMosID, remoteMosID, roId);
+
+                                }
+                                if ((roElementAction.Attribute("operation")?.Value ?? "") == "DELETE")
+                                {
+                                    Console.WriteLine("apaga story");
+                                    await dados.DeleteroElementAction(roElementAction);
+                                }
+                                //string ack = $"<mos><roAck><roID>{EscapeXml(roId)}</roID><roStatus>OK</roStatus></roAck></mos>";
+                                //await SendResponse(stream, ack, encoding);
+                            }
+
+                            if (!string.IsNullOrEmpty(roId))
+                            {
+                                string ack = $"<mos><roAck><roID>{EscapeXml(roId)}</roID><roStatus>OK</roStatus></roAck></mos>";
+                                await SendResponse(stream, ack, encoding);
+                            }
+
+                            else
+                            {
+                                //Console.WriteLine("Comando MOS não identificado; enviando ack genérico.");
+                                string ack = "<mos><roAck><roStatus>OK</roStatus></roAck></mos>";
+                                await SendResponse(stream, ack, encoding);
+                            }
                         }
-
-                        if (! string.IsNullOrEmpty(roId))
+                        catch (Exception ex)
                         {
-                            string ack = $"<mos><roAck><roID>{EscapeXml(roId)}</roID><roStatus>OK</roStatus></roAck></mos>";
+                            //Console.WriteLine("Erro ao parsear XML: " + ex.Message);
+                            // opcional: enviar roAck com erro
+                            string ack = "<mos><roAck><roStatus>ERROR</roStatus></roAck></mos>";
                             await SendResponse(stream, ack, encoding);
                         }
 
-                        else
-                        {
-                            Console.WriteLine("Comando MOS não identificado; enviando ack genérico.");
-                            string ack = "<mos><roAck><roStatus>OK</roStatus></roAck></mos>";
-                            await SendResponse(stream, ack, encoding);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine("Erro ao parsear XML: " + ex.Message);
-                        // opcional: enviar roAck com erro
-                        string ack = "<mos><roAck><roStatus>ERROR</roStatus></roAck></mos>";
-                        await SendResponse(stream, ack, encoding);
-                    }
+                        // calcular quantos bytes consumimos do buffer original
+                        // note: xmlString está sem BOM char; precisamos do tamanho em bytes dessa substring na mesma codificação
+                        int consumedBytesOfUsable = encoding.GetByteCount(xmlString);
+                        int totalConsumed = bomOffset + consumedBytesOfUsable;
 
-                    // calcular quantos bytes consumimos do buffer original
-                    // note: xmlString está sem BOM char; precisamos do tamanho em bytes dessa substring na mesma codificação
-                    int consumedBytesOfUsable = encoding.GetByteCount(xmlString);
-                    int totalConsumed = bomOffset + consumedBytesOfUsable;
+                        // remover do bufferList os bytes consumidos
+                        bufferList.RemoveRange(0, totalConsumed);
 
-                    // remover do bufferList os bytes consumidos
-                    bufferList.RemoveRange(0, totalConsumed);
-
-                    // Pode haver mais mensagens no buffer → repetir
-                    if (bufferList.Count > 0) loop = true;
-                } // while loop
+                        // Pode haver mais mensagens no buffer → repetir
+                        if (bufferList.Count > 0) loop = true;
+                    } // while loop
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Erro na conexão com {endpoint}: {ex.Message}");
+            }
+            finally
+            {
+                Console.WriteLine($"Conexão encerrada com {endpoint}");
+                client.Close();
             }
         }
-        catch (Exception ex)
+
+        // Detecta encoding com BOM ou heurística simples (UTF-16LE / UTF-16BE / UTF-8)
+        static Encoding DetectEncoding(byte[] bytes)
         {
-            Console.WriteLine($"Erro na conexão com {endpoint}: {ex.Message}");
+            if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) return Encoding.UTF8;
+            if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) return Encoding.Unicode; // UTF-16LE
+            if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) return Encoding.BigEndianUnicode; // UTF-16BE
+
+            // heurística: contar zeros nos bytes pares/ímpares
+            int evenZero = 0, oddZero = 0;
+            int pairs = Math.Min(bytes.Length / 2, 1000);
+            for (int i = 0; i + 1 < bytes.Length && i / 2 < pairs; i += 2)
+            {
+                if (bytes[i] == 0) evenZero++;
+                if (bytes[i + 1] == 0) oddZero++;
+            }
+
+            if (evenZero + oddZero == 0)
+            {
+                return Encoding.UTF8; // provavelmente UTF-8/ASCII
+            }
+
+            // se zeros aparecem mais nas posições pares => UTF-16BE
+            if (evenZero > oddZero) return Encoding.BigEndianUnicode;
+            return Encoding.Unicode; // caso contrário, UTF-16LE
         }
-        finally
+
+        // Envia resposta utilizando a mesma encoding do cliente (inclui BOM para UTF-16)
+        static async Task SendResponse(NetworkStream stream, string xmlBody, Encoding encoding)
         {
-            Console.WriteLine($"Conexão encerrada com {endpoint}");
-            client.Close();
+            // garantir declaração XML (opcional)
+            string encName = encoding == Encoding.Unicode ? "UTF-16LE" :
+                             encoding == Encoding.BigEndianUnicode ? "UTF-16BE" :
+                             "UTF-8";
+
+            string xml = xmlBody.Trim();
+            if (!xml.StartsWith("<?xml", StringComparison.OrdinalIgnoreCase))
+            {
+                xml = $"<?xml version=\"1.0\" encoding=\"{encName}\"?>\r\n" + xml;
+            }
+
+            byte[] payload = encoding.GetBytes(xml);
+
+            // adicionar BOM se UTF-16
+            if (encoding == Encoding.Unicode)
+            {
+                payload = Prepend(new byte[] { 0xFF, 0xFE }, payload);
+            }
+            else if (encoding == Encoding.BigEndianUnicode)
+            {
+                payload = Prepend(new byte[] { 0xFE, 0xFF }, payload);
+            }
+            // para UTF-8 não colocamos BOM por padrão (mas poderia se desejar)
+
+            await stream.WriteAsync(payload, 0, payload.Length);
+            //Console.WriteLine("Resposta enviada (" + encName + "):\n" + xml);
         }
+
+        static byte[] Prepend(byte[] prefix, byte[] data)
+        {
+            var outb = new byte[prefix.Length + data.Length];
+            Buffer.BlockCopy(prefix, 0, outb, 0, prefix.Length);
+            Buffer.BlockCopy(data, 0, outb, prefix.Length, data.Length);
+            return outb;
+        }
+
+        // escape simples para inserir em XML (caso necessário)
+        static string EscapeXml(string s) =>
+            s?.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;").Replace("'", "&apos;") ?? "";
     }
-
-    // Detecta encoding com BOM ou heurística simples (UTF-16LE / UTF-16BE / UTF-8)
-    static Encoding DetectEncoding(byte[] bytes)
-    {
-        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) return Encoding.UTF8;
-        if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) return Encoding.Unicode; // UTF-16LE
-        if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) return Encoding.BigEndianUnicode; // UTF-16BE
-
-        // heurística: contar zeros nos bytes pares/ímpares
-        int evenZero = 0, oddZero = 0;
-        int pairs = Math.Min(bytes.Length / 2, 1000);
-        for (int i = 0; i + 1 < bytes.Length && i / 2 < pairs; i += 2)
-        {
-            if (bytes[i] == 0) evenZero++;
-            if (bytes[i + 1] == 0) oddZero++;
-        }
-
-        if (evenZero + oddZero == 0)
-        {
-            return Encoding.UTF8; // provavelmente UTF-8/ASCII
-        }
-
-        // se zeros aparecem mais nas posições pares => UTF-16BE
-        if (evenZero > oddZero) return Encoding.BigEndianUnicode;
-        return Encoding.Unicode; // caso contrário, UTF-16LE
-    }
-
-    // Envia resposta utilizando a mesma encoding do cliente (inclui BOM para UTF-16)
-    static async Task SendResponse(NetworkStream stream, string xmlBody, Encoding encoding)
-    {
-        // garantir declaração XML (opcional)
-        string encName = encoding == Encoding.Unicode ? "UTF-16LE" :
-                         encoding == Encoding.BigEndianUnicode ? "UTF-16BE" :
-                         "UTF-8";
-
-        string xml = xmlBody.Trim();
-        if (!xml.StartsWith("<?xml", StringComparison.OrdinalIgnoreCase))
-        {
-            xml = $"<?xml version=\"1.0\" encoding=\"{encName}\"?>\r\n" + xml;
-        }
-
-        byte[] payload = encoding.GetBytes(xml);
-
-        // adicionar BOM se UTF-16
-        if (encoding == Encoding.Unicode)
-        {
-            payload = Prepend(new byte[] { 0xFF, 0xFE }, payload);
-        }
-        else if (encoding == Encoding.BigEndianUnicode)
-        {
-            payload = Prepend(new byte[] { 0xFE, 0xFF }, payload);
-        }
-        // para UTF-8 não colocamos BOM por padrão (mas poderia se desejar)
-
-        await stream.WriteAsync(payload, 0, payload.Length);
-        Console.WriteLine("Resposta enviada (" + encName + "):\n" + xml);
-    }
-
-    static byte[] Prepend(byte[] prefix, byte[] data)
-    {
-        var outb = new byte[prefix.Length + data.Length];
-        Buffer.BlockCopy(prefix, 0, outb, 0, prefix.Length);
-        Buffer.BlockCopy(data, 0, outb, prefix.Length, data.Length);
-        return outb;
-    }
-
-    // escape simples para inserir em XML (caso necessário)
-    static string EscapeXml(string s) =>
-        s?.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;").Replace("'", "&apos;") ?? "";
 }
