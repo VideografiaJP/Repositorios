@@ -1,139 +1,645 @@
-using System.Net.WebSockets;
+using System;
+using System.Collections.Generic;
+using System.Data.Common;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
-using System.Diagnostics;
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Transactions;
+using System.Xml.Linq;
+using Npgsql;
+using Microsoft.Win32;
+using NCrontab;
+using JovemPan.Socket;
+using System.Data.SqlTypes;
+using MQTTnet;
+using MQTTnet.Client.Options;
+using MQTTnet.Client;
 
-var builder = WebApplication.CreateBuilder(args);
-builder.WebHost.UseUrls("http://0.0.0.0:5000");
-//builder.WebHost.UseUrls("http://localhost:5000");
-
-var app = builder.Build();
-
-app.UseWebSockets();
-
-//bool EmExecucao(string nomeProcesso)
-//{
-//    return Process.GetProcessesByName(nomeProcesso).Any();
-//}
-
-// Uso:
-//bool vmixRodando = EmExecucao("vMix64");
-
-//if (vmixRodando)
-//    Console.WriteLine("vMix já está em execução");
-//else
-//    Console.WriteLine("vMix ainda não está rodando");
-//Console.WriteLine(builder.Configuration["appSettings:vMixPath"]);
-
-
-app.Map("/ws", async context =>
+namespace JovemPan.Socket
 {
-    if (context.WebSockets.IsWebSocketRequest)
+    class Program
     {
-        using var webSocket = await context.WebSockets.AcceptWebSocketAsync();
-        Console.WriteLine("🟢 Cliente conectado");
+        static readonly int[] PORTS = { 10540, 10541 };
+        public static Dados dados = new Dados();
+        static JsonDocument doc = null; 
 
-        var buffer = new byte[1024 * 4];
+        static string mosServerIP = "172.16.2.31"; // IP do servidor MOS 
+        static int mosServerPort = 10541; // Porta TCP do MOS
+        static string localMosID = "VMIX.MOS"; // Seu ID MOS
+        static string remoteMosID = "SRV-013-ENPS01"; // ID do servidor MOS
 
-        while (true)
+        static async Task Main()
         {
-            var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+            //await SendMessage($"{DateTime.Now}");
+            //return;
 
-            if (result.MessageType == WebSocketMessageType.Close)
+            Console.WriteLine("Agendador iniciado...");
+            _ = Jobs();
+            foreach (var p in PORTS) StartServer(p);
+            Console.WriteLine("Servidor MOS rodando...");
+
+            await Task.Delay(-1);
+        }
+
+        static async Task Jobs()
+        {
+            //var schedule = CrontabSchedule.Parse("0 5, 6 * * *"); // 05:00 e 06:00
+            //var schedule = CrontabSchedule.Parse("* * * * *"); // 05:00 e 06:00
+            var schedule = CrontabSchedule.Parse("0 */1 * * *"); // 05:00 e 06:00
+
+            DateTime next = schedule.GetNextOccurrence(DateTime.Now);
+
+            while (true)
             {
-                Console.WriteLine("Cliente desconectado");
-                await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Conexão encerrada", CancellationToken.None);
-                break;
-            }
+                var now = DateTime.Now;
 
-            var jsonString = Encoding.UTF8.GetString(buffer, 0, result.Count);
-            Console.WriteLine($"JSON recebido: {jsonString}");
+                if (now >= next)
+                {
+                    Console.WriteLine($"[{now}] Clean Log");
+                    next = schedule.GetNextOccurrence(now);
+                    _ = dados.CleanLog();
+                }
+
+                await Task.Delay(1000);
+            }
+        }
+
+        static async Task getroReqAll_()
+        {
+            string mosServerIP = "172.16.2.31"; // IP do servidor MOS 
+            int mosServerPort = 10540; // Porta TCP do MOS
+            string localMosID = "VMIX.MOS"; // Seu ID MOS
+            string remoteMosID = "SRV-013-ENPS01"; // ID do servidor MOS
+
+            string messageID = Guid.NewGuid().ToString();
+            string messageTime = DateTime.UtcNow.ToString("o"); // formato ISO 8601
+
+            // XML conforme padrão MOS
+            string roReqAllXml =
+                $@"<mos>
+            <mosID>{localMosID}</mosID>
+            <ncsID>{remoteMosID}</ncsID>
+            <messageID>{messageID}</messageID>
+            <messageTime>{messageTime}</messageTime>
+            <roReqAll/>
+        </mos>";
 
             try
             {
-                var command = JsonSerializer.Deserialize<CommandMessage>(jsonString);
+                using TcpClient client = new TcpClient();
+                Console.WriteLine($"Conectando ao servidor MOS {mosServerIP}:{mosServerPort}...");
+                await client.ConnectAsync(mosServerIP, mosServerPort);
 
-                if (command != null && command.Command == "openProgram")
+                using NetworkStream stream = client.GetStream();
+
+                // Adiciona 0x04 (EOT) no final
+                byte[] dataToSend = Encoding.UTF8.GetBytes(roReqAllXml + (char)0x04);
+
+                Console.WriteLine("Enviando roReqAll...");
+                await stream.WriteAsync(dataToSend, 0, dataToSend.Length);
+
+                // MOS normalmente mantém a conexão aberta, mas vamos tentar ler a resposta
+                byte[] buffer = new byte[8192];
+                int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+
+                if (bytesRead > 0)
                 {
-                    var vMixProcess_ = builder.Configuration["appSettings:vMixProcess"];
-                    var vMixFileName_ = builder.Configuration["appSettings:vMixFileName"];
-                    var vMixPath = builder.Configuration["appSettings:vMixPath"];
-
-                    if (vMixProcess_ == command.Program)
-                    {
-                        Console.WriteLine($"Verificando se {command.Program} está em execução...");
-
-                        var processos = Process.GetProcessesByName(command.Program);
-
-                        if (processos.Length > 0)
-                        {
-                            Console.WriteLine($"{command.Program} já está em execução. Encerrando...");
-
-                            foreach (var proc in processos)
-                            {
-                                try
-                                {
-                                    proc.Kill(true); // true: encerra subprocessos
-                                    proc.WaitForExit();
-                                    Console.WriteLine($"Processo {proc.Id} encerrado.");
-                                }
-                                catch (Exception ex)
-                                {
-                                    Console.WriteLine($"Erro ao encerrar {command.Program}: {ex.Message}");
-                                }
-                            }
-
-                            await Task.Delay(500); // pequena pausa para garantir fechamento completo
-                        }
-                        else
-                        {
-                            Console.WriteLine($"{command.Program} não está em execução.");
-                        }
-
-                        try
-                        {
-                            Process.Start(new ProcessStartInfo
-                            {
-                                WorkingDirectory = vMixPath,
-                                FileName = vMixFileName_,
-                                UseShellExecute = true
-                            });
-
-                            var response = Encoding.UTF8.GetBytes($"{command.Program} foi aberto com sucesso");
-                            await webSocket.SendAsync(new ArraySegment<byte>(response), WebSocketMessageType.Text, true, CancellationToken.None);
-                        }
-                        catch (Exception ex)
-                        {
-                            var error = Encoding.UTF8.GetBytes($"Erro ao abrir {command.Program}: {ex.Message}");
-                            await webSocket.SendAsync(new ArraySegment<byte>(error), WebSocketMessageType.Text, true, CancellationToken.None);
-                        }
-                    }
-                    else
-                    {
-                        var error = Encoding.UTF8.GetBytes("Programa não autorizado");
-                        await webSocket.SendAsync(new ArraySegment<byte>(error), WebSocketMessageType.Text, true, CancellationToken.None);
-                    }
+                    string response = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                    Console.WriteLine("Resposta recebida:");
+                    Console.WriteLine("(" + response + ")");
                 }
                 else
                 {
-                    var error = Encoding.UTF8.GetBytes("Comando inválido");
-                    await webSocket.SendAsync(new ArraySegment<byte>(error), WebSocketMessageType.Text, true, CancellationToken.None);
+                    Console.WriteLine("Nenhuma resposta recebida.");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine("Erro ao processar JSON: " + ex.Message);
-                var error = Encoding.UTF8.GetBytes("Erro ao processar comando");
-                await webSocket.SendAsync(new ArraySegment<byte>(error), WebSocketMessageType.Text, true, CancellationToken.None);
+                Console.WriteLine($"Erro: {ex.Message}");
             }
         }
-    }
-    else
-    {
-        context.Response.StatusCode = 400;
-    }
-});
 
-app.Run();
+        public static void SendHeartbeat(NetworkStream? _stream, TcpClient? _client, object? state)
+        {
+            if (_stream == null || !_client!.Connected) return;
 
-record CommandMessage(string Command, string Program);//, string ProgramFolder);
+            string heartbeat = $@"<mos>
+              <mosID>{localMosID}</mosID>
+              <ncsID>{remoteMosID}</ncsID>
+              <heartbeat>
+                <time>{DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss")}</time>
+              </heartbeat>  
+            </mos>\r\n";
+
+            byte[] data = Encoding.UTF8.GetBytes(heartbeat);
+            _stream.Write(data, 0, data.Length);
+            _stream.Flush();
+
+            string sLog = $"[{DateTime.Now}] Heartbeat enviado ";
+            Console.WriteLine(sLog);
+
+            _ = dados.AddLogAsync(new Models.Log { Message = sLog });
+        }
+
+        static void StartServer(int port)
+        {
+            _ = LoadPrograms();
+
+            var listener = new TcpListener(IPAddress.Any, port);
+            listener.Start();
+            Console.WriteLine($"Escutando na porta {port}");
+            _ = Task.Run(async () =>
+            {
+                while (true)
+                {
+                    var client = await listener.AcceptTcpClientAsync();
+                    _ = HandleClient(client, port);
+                }
+            });
+        }
+
+        static async Task LoadPrograms()
+        {
+            using var http = new HttpClient();
+            string url = "http://172.16.1.140:3000/api/programas/tarjasenews";
+            string json = await http.GetStringAsync(url);
+
+            doc = JsonDocument.Parse(json);
+        }
+
+        static int getProgram(string identificador)
+        {
+            string identificador_ = identificador.Split(';')[1].Split('\\')[0];
+            int program = 0;
+
+            foreach (var item in doc.RootElement.GetProperty("itens").EnumerateArray())
+            {
+                if (item.TryGetProperty("IdentificadorMOS", out var mosProp))
+                {
+                    if (mosProp.GetString() == identificador_)
+                    {
+                        return item.GetProperty("Id").GetInt32();
+                    }
+                }
+            }
+
+            return program;
+        }
+
+        public static async Task EnviarRoReqAllAsync(NetworkStream mosStream, string mosId, string ncsID, string roID)
+        {
+            if (mosStream == null || !mosStream.CanWrite)
+            {
+                Console.WriteLine("❌ Conexão MOS inativa.");
+                return;
+            }
+
+            Console.WriteLine("====== início roReqAll");
+
+            var xml = new XElement("mos",
+                new XElement("mosID", mosId),
+                new XElement("ncsID", ncsID),
+                new XElement("messageID", Guid.NewGuid().ToString()),
+                new XElement("messageTime", DateTime.UtcNow.ToString("o")),
+                new XElement("roReqAll",
+                    new XElement("roID", roID)
+                )
+            ).ToString(SaveOptions.DisableFormatting);
+
+            var mensagem = xml + (char)0x04; // Terminador MOS
+
+            var buffer = Encoding.UTF8.GetBytes(mensagem);
+            await mosStream.WriteAsync(buffer, 0, buffer.Length);
+            await mosStream.FlushAsync();
+
+            Console.WriteLine("====== fim roReqAll");
+        }
+
+        public static Timer? _heartbeatTimer;
+
+        static async Task HandleClient(TcpClient client, int port)
+        {
+            var endpoint = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
+            Console.WriteLine($"Conexão recebida de {endpoint} na porta {port}");
+
+            var stream = client.GetStream();
+            var bufferList = new List<byte>();
+            var readBuffer = new byte[4096];
+
+            //_heartbeatTimer = new Timer(SendHeartbeat(stream, client, ), null, TimeSpan.Zero, TimeSpan.FromSeconds(30));
+            _heartbeatTimer = new Timer(
+                state => SendHeartbeat(stream, client, state),
+                null,
+                TimeSpan.Zero,
+                TimeSpan.FromSeconds(30)
+            );
+
+            try
+            {
+                while (true)
+                {
+                    int n = await stream.ReadAsync(readBuffer, 0, readBuffer.Length);
+                    if (n == 0) break; // conexão fechada
+
+                    // Append bytes recebidos ao buffer
+                    for (int i = 0; i < n; i++) bufferList.Add(readBuffer[i]);
+
+                    // Tentar processar 1..N mensagens completas presentes no buffer
+                    bool loop = true;
+                    while (loop)
+                    {
+                        loop = false;
+                        if (bufferList.Count < 2) break; // nada suficiente ainda
+
+                        // Detecta encoding com base no conteúdo atual do buffer
+                        var bytesArray = bufferList.ToArray();
+                        var encoding = DetectEncoding(bytesArray);
+
+                        // Se for UTF-16 (LE/BE), precisamos de número par de bytes para decodificar corretamente
+                        if ((encoding == Encoding.Unicode || encoding == Encoding.BigEndianUnicode) && (bufferList.Count % 2 != 0))
+                        {
+                            // aguarda mais bytes
+                            break;
+                        }
+
+                        // Offset para pular BOM caso exista (2 bytes)
+                        int bomOffset = 0;
+                        if (bytesArray.Length >= 2)
+                        {
+                            if (bytesArray[0] == 0xFF && bytesArray[1] == 0xFE) bomOffset = 2; // UTF-16LE BOM
+                            else if (bytesArray[0] == 0xFE && bytesArray[1] == 0xFF) bomOffset = 2; // UTF-16BE BOM
+                            else if (bytesArray.Length >= 3 && bytesArray[0] == 0xEF && bytesArray[1] == 0xBB && bytesArray[2] == 0xBF) bomOffset = 3; // UTF-8 BOM
+                        }
+
+                        // Trabalha com uma cópia "útil" sem o BOM inicial
+                        var usable = bytesArray.Skip(bomOffset).ToArray();
+                        string messageCandidate;
+                        try
+                        {
+                            messageCandidate = encoding.GetString(usable);
+                        }
+                        catch
+                        {
+                            // fallback para UTF-8 se houver problema
+                            messageCandidate = Encoding.UTF8.GetString(usable);
+                            encoding = Encoding.UTF8;
+                        }
+
+                        // Remove eventual BOM char Unicode (U+FEFF) e trim
+                        messageCandidate = messageCandidate.TrimStart('\uFEFF').Trim();
+                        messageCandidate = Regex.Replace(
+                            messageCandidate, @"^[\s\S]*?(<mos\b)", "$1", RegexOptions.IgnoreCase);
+
+                        // Procurar por fechamento de mensagem MOS
+                        int endIdx = messageCandidate.IndexOf("</mos>", StringComparison.Ordinal);
+                        if (endIdx == -1)
+                        {
+                            // Não há mensagem completa ainda → aguarda mais bytes
+                            break;
+                        }
+
+                        // Temos pelo menos uma mensagem completa
+                        int inclusive = endIdx + "</mos>".Length;
+
+                        string xmlString = messageCandidate.Substring(0, inclusive);
+
+                        // Parse e tratamento
+                        try
+                        {
+                            //dados.addLog(new Models.Log() { Message = xmlString });
+                            if (xmlString == "</mos>") throw new Exception("ACK");
+
+                            await dados.AddLogAsync(new Models.Log { Message = xmlString });                                                       
+                            
+                            //await SendMessage(xmlString);
+
+                            var doc = XDocument.Parse(xmlString);
+                            //Console.WriteLine($"============================\n{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss ")}" + $"\n============================\nXML parseado:\n" + xmlString);
+                            //var now = DateTime.Now;
+                            Console.WriteLine($"============================\n[{DateTime.Now}] command received" + $"\n============================");
+                            string roId = "";
+
+                            //ok
+                            var roCreate = doc.Root.Element("roCreate");
+                            if (roCreate != null)
+                            {
+                                roId = roCreate.Element("roID")?.Value ?? "";
+                                int idEmpresa = getProgram(roId.ToString());
+                                //Console.WriteLine("roCreate identificado: " + roId);
+                                var json_ = await dados.AddRoCreate(roCreate, idEmpresa);
+                                var json = JsonSerializer.Serialize(new
+                                {
+                                    command = "roCreate",
+                                    Programa = idEmpresa,
+                                    roCreate = json_
+                                });
+                                await SendMessage(json.ToString());
+                            }
+
+                            //ok
+                            var roStorySend = doc.Root.Element("roStorySend");
+                            if (roStorySend != null)
+                            {
+                                roId = roStorySend.Element("roID")?.Value ?? "";
+                                var storyID = roStorySend.Element("storyID")?.Value ?? "";
+                                var storySlug = roStorySend.Element("storySlug")?.Value ?? "";
+                                //Console.WriteLine("roStorySend identificado: " + roId);
+                                //Console.WriteLine("storyID identificado: " + storyID);
+                                //Console.WriteLine("storySlug identificado: " + storySlug);
+                                var conteudoCompleto = roStorySend.Element("storyBody")?.Value ?? "";
+                                //Console.WriteLine("storyBody : " + conteudoCompleto);
+
+                                //var matches = Regex.Matches(conteudoCompleto, @"\[CG\s*:(.*?)\]");
+
+                                //foreach (Match match in matches)
+                                //{
+                                //    string conteudo = match.Groups[1].Value; // tudo que estava dentro
+                                //    Console.WriteLine($"Capturado: {conteudo}");
+                                //    // Se quiser fazer split por barra invertida '\'
+                                //    var partes = conteudo.Split('\\');
+                                //    Console.WriteLine("Partes:");
+                                //    foreach (var p in partes)
+                                //    {
+                                //        Console.WriteLine($" - {p}");
+                                //    }
+                                //    //Console.WriteLine();
+                                //}
+
+                                //await dados.AddRoStorySend(roStorySend);
+                                int idEmpresa = getProgram(roId.ToString());
+                                var json_ = await dados.AddRoStorySend(roStorySend);
+                                var json = JsonSerializer.Serialize(new
+                                {
+                                    command = "roStorySend",
+                                    Programa = idEmpresa,
+                                    roStorySend = json_
+                                });
+
+                                await SendMessage(json.ToString());
+
+                                // Se quiser apenas o conteúdo interno (sem a tag <roStorySend>)
+                                //string conteudoInterno = string.Concat(roStorySend.Elements());
+                                //Console.WriteLine(conteudoInterno);
+                            }
+
+                            //ok, nada a fazer
+                            var roReadyToAir = doc.Root.Element("roReadyToAir");
+                            if (roReadyToAir != null)
+                            {
+                                roId = roReadyToAir.Element("roID")?.Value ?? "";
+                                //Console.WriteLine("roReadyToAir identificado: " + roId);
+                            }
+
+                            //ok
+                            var roDelete = doc.Root.Element("roDelete");
+                            if (roDelete != null)
+                            {
+                                roId = roDelete.Element("roID")?.Value ?? "";
+                                int idEmpresa = getProgram(roId.ToString());
+                                //Console.WriteLine("roDelete identificado: " + roId);
+                                await dados.RemoveRoDelete(roId);
+                                var json = JsonSerializer.Serialize(new
+                                {
+                                    command = "roDelete",
+                                    Programa = idEmpresa
+                                });
+
+                                await SendMessage(json.ToString());
+                            }
+
+                            //ok, nada a fazer
+                            var roReq = doc.Root.Element("roReq");
+                            if (roReq != null)
+                            {
+                                roId = roReq.Element("roID")?.Value ?? "";
+                                //Console.WriteLine("roReq identificado: " + roId);
+                            }
+
+                            // implementando ...
+                            var roElementAction = doc.Root.Element("roElementAction");
+                            if (roElementAction != null)
+                            {
+                                roId = roElementAction.Element("roID")?.Value ?? "";
+                                int idEmpresa = getProgram(roId.ToString());
+                                //Console.WriteLine("roElementAction identificado: " + roId);
+                                if ((roElementAction.Attribute("operation")?.Value ?? "") == "INSERT")
+                                {
+                                    //Console.WriteLine("add story");
+                                    //await dados.InsertroElementAction(roElementAction);
+
+                                    var json_ = await dados.InsertroElementAction(roElementAction);
+                                    var json = JsonSerializer.Serialize(new
+                                    {
+                                        command = "roElementAction",
+                                        operation = "INSERT",
+                                        Programa = idEmpresa,
+                                        roElementAction = json_
+                                    });
+
+                                    await SendMessage(json.ToString());
+                                }
+
+                                if ((roElementAction.Attribute("operation")?.Value ?? "") == "REPLACE")
+                                {
+                                    //Console.WriteLine("update story");
+                                    //await dados.UpdateStorySlugroElementAction(roElementAction);
+                                    var json_ = await dados.UpdateStorySlugroElementAction(roElementAction);
+                                    var json = JsonSerializer.Serialize(new
+                                    {
+                                        command = "roElementAction",
+                                        operation = "REPLACE",
+                                        Programa =  idEmpresa,
+                                        roElementAction = json_
+                                    });
+
+                                    await SendMessage(json.ToString());
+                                }
+
+                                if ((roElementAction.Attribute("operation")?.Value ?? "") == "MOVE")
+                                {
+                                    //Console.WriteLine("move story");
+                                    //await dados.UpdateOrdemroElementAction(roElementAction);
+                                    var json_ = await dados.UpdateOrdemroElementAction(roElementAction);
+
+                                    //_ = dados.EnviarRoReqAllAsync(mosServerIP, 10541, roId);
+                                    //_ = EnviarRoReqAll(stream);
+                                    //_ = EnviarRoReqAllAsync(stream, localMosID, remoteMosID, roId);
+
+                                    var json = JsonSerializer.Serialize(new
+                                    {
+                                        command = "roElementAction",
+                                        operation = "MOVE",
+                                        Programa = idEmpresa,
+                                        roElementAction = json_
+                                    });
+                                    await SendMessage(json.ToString());
+
+                                }
+                                if ((roElementAction.Attribute("operation")?.Value ?? "") == "DELETE")
+                                {
+                                    //Console.WriteLine("apaga story");
+                                    //await dados.DeleteroElementAction(roElementAction);
+                                    var json_ = await dados.DeleteroElementAction(roElementAction);
+                                    var json = JsonSerializer.Serialize(new
+                                    {
+                                        command = "roElementAction",
+                                        operation = "DELETE",
+                                        Programa = idEmpresa,
+                                        roElementAction = json_
+                                    });
+
+                                    await SendMessage(json.ToString());
+                                }
+                                //string ack = $"<mos><roAck><roID>{EscapeXml(roId)}</roID><roStatus>OK</roStatus></roAck></mos>";
+                                //await SendResponse(stream, ack, encoding);
+                            }
+
+                            if (!string.IsNullOrEmpty(roId))
+                            {
+                                string ack = $"<mos><roAck><roID>{EscapeXml(roId)}</roID><roStatus>OK</roStatus></roAck></mos>";
+                                await SendResponse(stream, ack, encoding);
+                            }
+
+                            else
+                            {
+                                //Console.WriteLine("Comando MOS não identificado; enviando ack genérico.");
+                                string ack = "<mos><roAck><roStatus>OK</roStatus></roAck></mos>";
+                                await SendResponse(stream, ack, encoding);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            //Console.WriteLine("Erro ao parsear XML: " + ex.Message);
+                            // opcional: enviar roAck com erro
+                            string ack = "<mos><roAck><roStatus>ERROR</roStatus></roAck></mos>";
+                            await SendResponse(stream, ack, encoding);
+                        }
+
+                        // calcular quantos bytes consumimos do buffer original
+                        // note: xmlString está sem BOM char; precisamos do tamanho em bytes dessa substring na mesma codificação
+                        int consumedBytesOfUsable = encoding.GetByteCount(xmlString);
+                        int totalConsumed = bomOffset + consumedBytesOfUsable;
+
+                        // remover do bufferList os bytes consumidos
+                        bufferList.RemoveRange(0, totalConsumed);
+
+                        // Pode haver mais mensagens no buffer → repetir
+                        if (bufferList.Count > 0) loop = true;
+                    } // while loop
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Erro na conexão com {endpoint}: {ex.Message}");
+            }
+            finally
+            {
+                Console.WriteLine($"Conexão encerrada com {endpoint}");
+                client.Close();
+            }
+        }
+
+        // Detecta encoding com BOM ou heurística simples (UTF-16LE / UTF-16BE / UTF-8)
+        static Encoding DetectEncoding(byte[] bytes)
+        {
+            if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) return Encoding.UTF8;
+            if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) return Encoding.Unicode; // UTF-16LE
+            if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) return Encoding.BigEndianUnicode; // UTF-16BE
+
+            // heurística: contar zeros nos bytes pares/ímpares
+            int evenZero = 0, oddZero = 0;
+            int pairs = Math.Min(bytes.Length / 2, 1000);
+            for (int i = 0; i + 1 < bytes.Length && i / 2 < pairs; i += 2)
+            {
+                if (bytes[i] == 0) evenZero++;
+                if (bytes[i + 1] == 0) oddZero++;
+            }
+
+            if (evenZero + oddZero == 0)
+            {
+                return Encoding.UTF8; // provavelmente UTF-8/ASCII
+            }
+
+            // se zeros aparecem mais nas posições pares => UTF-16BE
+            if (evenZero > oddZero) return Encoding.BigEndianUnicode;
+            return Encoding.Unicode; // caso contrário, UTF-16LE
+        }
+
+        // Envia resposta utilizando a mesma encoding do cliente (inclui BOM para UTF-16)
+        static async Task SendResponse(NetworkStream stream, string xmlBody, Encoding encoding)
+        {
+            // garantir declaração XML (opcional)
+            string encName = encoding == Encoding.Unicode ? "UTF-16LE" :
+                             encoding == Encoding.BigEndianUnicode ? "UTF-16BE" :
+                             "UTF-8";
+
+            string xml = xmlBody.Trim();
+            if (!xml.StartsWith("<?xml", StringComparison.OrdinalIgnoreCase))
+            {
+                xml = $"<?xml version=\"1.0\" encoding=\"{encName}\"?>\r\n" + xml;
+            }
+
+            byte[] payload = encoding.GetBytes(xml);
+
+            // adicionar BOM se UTF-16
+            if (encoding == Encoding.Unicode)
+            {
+                payload = Prepend(new byte[] { 0xFF, 0xFE }, payload);
+            }
+            else if (encoding == Encoding.BigEndianUnicode)
+            {
+                payload = Prepend(new byte[] { 0xFE, 0xFF }, payload);
+            }
+            // para UTF-8 não colocamos BOM por padrão (mas poderia se desejar)
+
+            await stream.WriteAsync(payload, 0, payload.Length);
+            //Console.WriteLine("Resposta enviada (" + encName + "):\n" + xml);
+        }
+
+        static byte[] Prepend(byte[] prefix, byte[] data)
+        {
+            var outb = new byte[prefix.Length + data.Length];
+            Buffer.BlockCopy(prefix, 0, outb, 0, prefix.Length);
+            Buffer.BlockCopy(data, 0, outb, prefix.Length, data.Length);
+            return outb;
+        }
+
+        // escape simples para inserir em XML (caso necessário)
+        static string EscapeXml(string s) =>
+            s?.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;").Replace("'", "&apos;") ?? "";
+
+        static async Task SendMessage(string payload)
+        {
+            var factory = new MqttFactory();
+            var mqttClient = factory.CreateMqttClient();
+
+            var options = new MqttClientOptionsBuilder()
+                .WithWebSocketServer("172.16.2.16:15675/ws") // IP do RabbitMQ + porta do Web MQTT
+                .WithCredentials("admin", "senha123")
+                .WithClientId("dotnet_client_" + Guid.NewGuid().ToString("N"))
+                .WithCleanSession()
+                .Build();
+
+            await mqttClient.ConnectAsync(options);
+
+            var message = new MqttApplicationMessageBuilder()
+                .WithTopic("MOS")
+                .WithPayload(payload)
+                .WithAtLeastOnceQoS()
+                .Build();
+
+            await mqttClient.PublishAsync(message);
+
+            //Console.WriteLine($"📤 Mensagem publicada no tópico MOS: {payload}");
+
+            await mqttClient.DisconnectAsync();
+        }
+
+    }
+}
