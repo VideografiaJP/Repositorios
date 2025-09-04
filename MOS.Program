@@ -16,6 +16,10 @@ using Npgsql;
 using Microsoft.Win32;
 using NCrontab;
 using JovemPan.Socket;
+using System.Data.SqlTypes;
+using MQTTnet;
+using MQTTnet.Client.Options;
+using MQTTnet.Client;
 
 namespace JovemPan.Socket
 {
@@ -23,7 +27,7 @@ namespace JovemPan.Socket
     {
         static readonly int[] PORTS = { 10540, 10541 };
         public static Dados dados = new Dados();
-        static JsonDocument doc = null;
+        static JsonDocument doc = null; 
 
         static string mosServerIP = "172.16.2.31"; // IP do servidor MOS 
         static int mosServerPort = 10541; // Porta TCP do MOS
@@ -32,6 +36,9 @@ namespace JovemPan.Socket
 
         static async Task Main()
         {
+            //await SendMessage($"{DateTime.Now}");
+            //return;
+
             Console.WriteLine("Agendador iniciado...");
             _ = Jobs();
             foreach (var p in PORTS) StartServer(p);
@@ -43,7 +50,8 @@ namespace JovemPan.Socket
         static async Task Jobs()
         {
             //var schedule = CrontabSchedule.Parse("0 5, 6 * * *"); // 05:00 e 06:00
-            var schedule = CrontabSchedule.Parse("* * * * *"); // 05:00 e 06:00
+            //var schedule = CrontabSchedule.Parse("* * * * *"); // 05:00 e 06:00
+            var schedule = CrontabSchedule.Parse("0 */1 * * *"); // 05:00 e 06:00
 
             DateTime next = schedule.GetNextOccurrence(DateTime.Now);
 
@@ -55,6 +63,7 @@ namespace JovemPan.Socket
                 {
                     Console.WriteLine($"[{now}] Clean Log");
                     next = schedule.GetNextOccurrence(now);
+                    _ = dados.CleanLog();
                 }
 
                 await Task.Delay(1000);
@@ -114,6 +123,28 @@ namespace JovemPan.Socket
             {
                 Console.WriteLine($"Erro: {ex.Message}");
             }
+        }
+
+        public static void SendHeartbeat(NetworkStream? _stream, TcpClient? _client, object? state)
+        {
+            if (_stream == null || !_client!.Connected) return;
+
+            string heartbeat = $@"<mos>
+              <mosID>{localMosID}</mosID>
+              <ncsID>{remoteMosID}</ncsID>
+              <heartbeat>
+                <time>{DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss")}</time>
+              </heartbeat>  
+            </mos>\r\n";
+
+            byte[] data = Encoding.UTF8.GetBytes(heartbeat);
+            _stream.Write(data, 0, data.Length);
+            _stream.Flush();
+
+            string sLog = $"[{DateTime.Now}] Heartbeat enviado ";
+            Console.WriteLine(sLog);
+
+            _ = dados.AddLogAsync(new Models.Log { Message = sLog });
         }
 
         static void StartServer(int port)
@@ -190,6 +221,8 @@ namespace JovemPan.Socket
             Console.WriteLine("====== fim roReqAll");
         }
 
+        public static Timer? _heartbeatTimer;
+
         static async Task HandleClient(TcpClient client, int port)
         {
             var endpoint = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
@@ -198,6 +231,14 @@ namespace JovemPan.Socket
             var stream = client.GetStream();
             var bufferList = new List<byte>();
             var readBuffer = new byte[4096];
+
+            //_heartbeatTimer = new Timer(SendHeartbeat(stream, client, ), null, TimeSpan.Zero, TimeSpan.FromSeconds(30));
+            _heartbeatTimer = new Timer(
+                state => SendHeartbeat(stream, client, state),
+                null,
+                TimeSpan.Zero,
+                TimeSpan.FromSeconds(30)
+            );
 
             try
             {
@@ -274,11 +315,14 @@ namespace JovemPan.Socket
                             //dados.addLog(new Models.Log() { Message = xmlString });
                             if (xmlString == "</mos>") throw new Exception("ACK");
 
-                            await dados.AddLogAsync(new Models.Log { Message = xmlString });
+                            await dados.AddLogAsync(new Models.Log { Message = xmlString });                                                       
+                            
+                            //await SendMessage(xmlString);
 
                             var doc = XDocument.Parse(xmlString);
                             //Console.WriteLine($"============================\n{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss ")}" + $"\n============================\nXML parseado:\n" + xmlString);
-                            Console.WriteLine($"============================\n{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss ")}" + $"\n============================");
+                            //var now = DateTime.Now;
+                            Console.WriteLine($"============================\n[{DateTime.Now}] command received" + $"\n============================");
                             string roId = "";
 
                             //ok
@@ -286,9 +330,16 @@ namespace JovemPan.Socket
                             if (roCreate != null)
                             {
                                 roId = roCreate.Element("roID")?.Value ?? "";
-                                dados.idEmpresa = getProgram(roId.ToString());
-                                Console.WriteLine("roCreate identificado: " + roId);
-                                await dados.AddRoCreate(roCreate);
+                                int idEmpresa = getProgram(roId.ToString());
+                                //Console.WriteLine("roCreate identificado: " + roId);
+                                var json_ = await dados.AddRoCreate(roCreate, idEmpresa);
+                                var json = JsonSerializer.Serialize(new
+                                {
+                                    command = "roCreate",
+                                    Programa = idEmpresa,
+                                    roCreate = json_
+                                });
+                                await SendMessage(json.ToString());
                             }
 
                             //ok
@@ -320,7 +371,17 @@ namespace JovemPan.Socket
                                 //    //Console.WriteLine();
                                 //}
 
-                                await dados.AddRoStorySend(roStorySend);
+                                //await dados.AddRoStorySend(roStorySend);
+                                int idEmpresa = getProgram(roId.ToString());
+                                var json_ = await dados.AddRoStorySend(roStorySend);
+                                var json = JsonSerializer.Serialize(new
+                                {
+                                    command = "roStorySend",
+                                    Programa = idEmpresa,
+                                    roStorySend = json_
+                                });
+
+                                await SendMessage(json.ToString());
 
                                 // Se quiser apenas o conteúdo interno (sem a tag <roStorySend>)
                                 //string conteudoInterno = string.Concat(roStorySend.Elements());
@@ -332,7 +393,7 @@ namespace JovemPan.Socket
                             if (roReadyToAir != null)
                             {
                                 roId = roReadyToAir.Element("roID")?.Value ?? "";
-                                Console.WriteLine("roReadyToAir identificado: " + roId);
+                                //Console.WriteLine("roReadyToAir identificado: " + roId);
                             }
 
                             //ok
@@ -340,8 +401,16 @@ namespace JovemPan.Socket
                             if (roDelete != null)
                             {
                                 roId = roDelete.Element("roID")?.Value ?? "";
-                                Console.WriteLine("roDelete identificado: " + roId);
+                                int idEmpresa = getProgram(roId.ToString());
+                                //Console.WriteLine("roDelete identificado: " + roId);
                                 await dados.RemoveRoDelete(roId);
+                                var json = JsonSerializer.Serialize(new
+                                {
+                                    command = "roDelete",
+                                    Programa = idEmpresa
+                                });
+
+                                await SendMessage(json.ToString());
                             }
 
                             //ok, nada a fazer
@@ -349,7 +418,7 @@ namespace JovemPan.Socket
                             if (roReq != null)
                             {
                                 roId = roReq.Element("roID")?.Value ?? "";
-                                Console.WriteLine("roReq identificado: " + roId);
+                                //Console.WriteLine("roReq identificado: " + roId);
                             }
 
                             // implementando ...
@@ -357,32 +426,75 @@ namespace JovemPan.Socket
                             if (roElementAction != null)
                             {
                                 roId = roElementAction.Element("roID")?.Value ?? "";
-                                Console.WriteLine("roElementAction identificado: " + roId);
+                                int idEmpresa = getProgram(roId.ToString());
+                                //Console.WriteLine("roElementAction identificado: " + roId);
                                 if ((roElementAction.Attribute("operation")?.Value ?? "") == "INSERT")
                                 {
-                                    Console.WriteLine("add story");
-                                    await dados.InsertroElementAction(roElementAction);
+                                    //Console.WriteLine("add story");
+                                    //await dados.InsertroElementAction(roElementAction);
+
+                                    var json_ = await dados.InsertroElementAction(roElementAction);
+                                    var json = JsonSerializer.Serialize(new
+                                    {
+                                        command = "roElementAction",
+                                        operation = "INSERT",
+                                        Programa = idEmpresa,
+                                        roElementAction = json_
+                                    });
+
+                                    await SendMessage(json.ToString());
                                 }
 
                                 if ((roElementAction.Attribute("operation")?.Value ?? "") == "REPLACE")
                                 {
-                                    Console.WriteLine("update story");
-                                    await dados.UpdateStorySlugroElementAction(roElementAction);
+                                    //Console.WriteLine("update story");
+                                    //await dados.UpdateStorySlugroElementAction(roElementAction);
+                                    var json_ = await dados.UpdateStorySlugroElementAction(roElementAction);
+                                    var json = JsonSerializer.Serialize(new
+                                    {
+                                        command = "roElementAction",
+                                        operation = "REPLACE",
+                                        Programa =  idEmpresa,
+                                        roElementAction = json_
+                                    });
+
+                                    await SendMessage(json.ToString());
                                 }
 
                                 if ((roElementAction.Attribute("operation")?.Value ?? "") == "MOVE")
                                 {
-                                    Console.WriteLine("move story");
-                                    await dados.UpdateOrdemroElementAction(roElementAction);
+                                    //Console.WriteLine("move story");
+                                    //await dados.UpdateOrdemroElementAction(roElementAction);
+                                    var json_ = await dados.UpdateOrdemroElementAction(roElementAction);
+
                                     //_ = dados.EnviarRoReqAllAsync(mosServerIP, 10541, roId);
                                     //_ = EnviarRoReqAll(stream);
                                     //_ = EnviarRoReqAllAsync(stream, localMosID, remoteMosID, roId);
 
+                                    var json = JsonSerializer.Serialize(new
+                                    {
+                                        command = "roElementAction",
+                                        operation = "MOVE",
+                                        Programa = idEmpresa,
+                                        roElementAction = json_
+                                    });
+                                    await SendMessage(json.ToString());
+
                                 }
                                 if ((roElementAction.Attribute("operation")?.Value ?? "") == "DELETE")
                                 {
-                                    Console.WriteLine("apaga story");
-                                    await dados.DeleteroElementAction(roElementAction);
+                                    //Console.WriteLine("apaga story");
+                                    //await dados.DeleteroElementAction(roElementAction);
+                                    var json_ = await dados.DeleteroElementAction(roElementAction);
+                                    var json = JsonSerializer.Serialize(new
+                                    {
+                                        command = "roElementAction",
+                                        operation = "DELETE",
+                                        Programa = idEmpresa,
+                                        roElementAction = json_
+                                    });
+
+                                    await SendMessage(json.ToString());
                                 }
                                 //string ack = $"<mos><roAck><roID>{EscapeXml(roId)}</roID><roStatus>OK</roStatus></roAck></mos>";
                                 //await SendResponse(stream, ack, encoding);
@@ -501,5 +613,33 @@ namespace JovemPan.Socket
         // escape simples para inserir em XML (caso necessário)
         static string EscapeXml(string s) =>
             s?.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;").Replace("'", "&apos;") ?? "";
+
+        static async Task SendMessage(string payload)
+        {
+            var factory = new MqttFactory();
+            var mqttClient = factory.CreateMqttClient();
+
+            var options = new MqttClientOptionsBuilder()
+                .WithWebSocketServer("172.16.2.16:15675/ws") // IP do RabbitMQ + porta do Web MQTT
+                .WithCredentials("admin", "senha123")
+                .WithClientId("dotnet_client_" + Guid.NewGuid().ToString("N"))
+                .WithCleanSession()
+                .Build();
+
+            await mqttClient.ConnectAsync(options);
+
+            var message = new MqttApplicationMessageBuilder()
+                .WithTopic("MOS")
+                .WithPayload(payload)
+                .WithAtLeastOnceQoS()
+                .Build();
+
+            await mqttClient.PublishAsync(message);
+
+            //Console.WriteLine($"📤 Mensagem publicada no tópico MOS: {payload}");
+
+            await mqttClient.DisconnectAsync();
+        }
+
     }
 }
