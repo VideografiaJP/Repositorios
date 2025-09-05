@@ -432,6 +432,7 @@ namespace JovemPan.Socket
                                 {
                                     //Console.WriteLine("add story");
                                     //await dados.InsertroElementAction(roElementAction);
+                                    //Console.WriteLine("move story\r\n" + xmlString);
 
                                     var json_ = await dados.InsertroElementAction(roElementAction);
                                     var json = JsonSerializer.Serialize(new
@@ -463,7 +464,7 @@ namespace JovemPan.Socket
 
                                 if ((roElementAction.Attribute("operation")?.Value ?? "") == "MOVE")
                                 {
-                                    //Console.WriteLine("move story");
+                                    //Console.WriteLine("move story\r\n" + xmlString);
                                     //await dados.UpdateOrdemroElementAction(roElementAction);
                                     var json_ = await dados.UpdateOrdemroElementAction(roElementAction);
 
@@ -481,10 +482,12 @@ namespace JovemPan.Socket
                                     await SendMessage(json.ToString());
 
                                 }
+                                
                                 if ((roElementAction.Attribute("operation")?.Value ?? "") == "DELETE")
                                 {
                                     //Console.WriteLine("apaga story");
                                     //await dados.DeleteroElementAction(roElementAction);
+                                    //Console.WriteLine("move story\r\n" + xmlString);
                                     var json_ = await dados.DeleteroElementAction(roElementAction);
                                     var json = JsonSerializer.Serialize(new
                                     {
