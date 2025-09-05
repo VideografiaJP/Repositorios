@@ -110,7 +110,7 @@ namespace JovemPan.Socket
                     insertStoryCmd.Parameters.Add("Titulo", NpgsqlTypes.NpgsqlDbType.Text);
                     insertStoryCmd.Parameters.Add("Ordem", NpgsqlTypes.NpgsqlDbType.Integer);
 
-                    int order = 1;
+                    int order = 0;
                     foreach (var s in item.Elements("story"))
                     {
                         insertStoryCmd.Parameters["RundownId"].Value = rundownId;
@@ -120,21 +120,21 @@ namespace JovemPan.Socket
                         insertStoryCmd.Parameters["Ordem"].Value = order++;
 
                         await insertStoryCmd.ExecuteNonQueryAsync();
-                    }
-
-                    // reconsulta rundown + stories atualizados
+                        }
+                    
+                    //reconsulta rundown + stories atualizados
                     const string selectFinalJson = @"
-                SELECT json_build_object(
-                    'rundown', row_to_json(r),
-                    'stories', (
-                        SELECT json_agg(s)
-                        FROM ""MOS"".""Stories"" s
-                        WHERE s.""RundownId"" = r.""Id""
+                    SELECT json_build_object(
+                        'rundown', row_to_json(r),
+                        'stories', (
+                            SELECT json_agg(s ORDER BY s.""Ordem"")
+                            FROM ""MOS"".""Stories"" s
+                            WHERE s.""RundownId"" = r.""Id""
+                        )
                     )
-                )
-                FROM ""MOS"".""Rundowns"" r
-                WHERE r.""Id"" = @RundownId;
-            ";
+                    FROM ""MOS"".""Rundowns"" r
+                    WHERE r.""Id"" = @RundownId;
+                    ";
 
                     await using var selectCmd = new NpgsqlCommand(selectFinalJson, conn, transaction);
                     selectCmd.Parameters.AddWithValue("RundownId", rundownId);
@@ -553,6 +553,153 @@ namespace JovemPan.Socket
 
         public async Task<string> UpdateOrdemroElementAction(XElement item)
         {
+            await using var conn = new NpgsqlConnection(cnPG);
+            await conn.OpenAsync();
+
+            await using var tx = await conn.BeginTransactionAsync();
+
+            try
+            {
+                var roId = item.Element("roID")?.Value ?? "";
+                var storyIdSource = item.Element("element_source")?.Element("storyID")?.Value ?? "";
+                var storyIdTarget = item.Element("element_target")?.Element("storyID")?.Value ?? "";
+
+                if (string.IsNullOrEmpty(roId) || string.IsNullOrEmpty(storyIdSource))
+                    throw new Exception("roId ou storyIdSource inválidos.");
+
+                int ordemSource;
+                int ordemTarget;
+
+                // 🔹 Se destino vier vazio → mover para o final
+                if (string.IsNullOrEmpty(storyIdTarget))
+                {
+                    var getMaxSql = @"
+                SELECT COALESCE(MAX(""Ordem""),0) + 1 
+                FROM ""MOS"".""Stories"" 
+                WHERE ""RundownId"" = (
+                    SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @roId LIMIT 1
+                )";
+
+                    await using (var cmd = new NpgsqlCommand(getMaxSql, conn, tx))
+                    {
+                        cmd.Parameters.AddWithValue("roId", roId);
+                        ordemTarget = Convert.ToInt32(await cmd.ExecuteScalarAsync());
+                    }
+                }
+                else
+                {
+                    const string getOrderSql = @"SELECT ""Ordem"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @id";
+
+                    await using (var cmd = new NpgsqlCommand(getOrderSql, conn, tx))
+                    {
+                        cmd.Parameters.AddWithValue("id", storyIdTarget);
+                        ordemTarget = Convert.ToInt32(await cmd.ExecuteScalarAsync() ?? 0);
+                    }
+                }
+
+                // 🔹 Sempre pega a ordem da origem
+                const string getOrderSourceSql = @"SELECT ""Ordem"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @id";
+                await using (var cmd = new NpgsqlCommand(getOrderSourceSql, conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("id", storyIdSource);
+                    ordemSource = Convert.ToInt32(await cmd.ExecuteScalarAsync() ?? 0);
+                }
+
+                // 🔹 Ajuste das ordens dos outros elementos
+                if (ordemSource < ordemTarget)
+                {
+                    // Como o ENPS envia o destino como o story de referência,
+                    // precisamos ajustar para que a source vá logo após o target
+                    ordemTarget--;
+
+                    const string updateSql = @"UPDATE ""MOS"".""Stories""
+                        SET ""Ordem"" = ""Ordem"" - 1
+                        WHERE ""RundownId"" = (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @roId LIMIT 1)
+                        AND ""Ordem"" > @ordemSource AND ""Ordem"" <= @ordemTarget";
+
+                    await using (var cmd = new NpgsqlCommand(updateSql, conn, tx))
+                    {
+                        cmd.Parameters.AddWithValue("roId", roId);
+                        cmd.Parameters.AddWithValue("ordemSource", ordemSource);
+                        cmd.Parameters.AddWithValue("ordemTarget", ordemTarget);
+                        await cmd.ExecuteNonQueryAsync();
+                    }
+                }
+                else if (ordemSource > ordemTarget)
+                {
+                    // Move para cima → incrementa quem está entre Target e Source
+                    const string updateSql = @"  UPDATE ""MOS"".""Stories""
+                        SET ""Ordem"" = ""Ordem"" + 1
+                        WHERE ""RundownId"" = (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @roId LIMIT 1)
+                        AND ""Ordem"" >= @ordemTarget AND ""Ordem"" < @ordemSource";
+
+                    await using (var cmd = new NpgsqlCommand(updateSql, conn, tx))
+                    {
+                        cmd.Parameters.AddWithValue("roId", roId);
+                        cmd.Parameters.AddWithValue("ordemSource", ordemSource);
+                        cmd.Parameters.AddWithValue("ordemTarget", ordemTarget);
+                        await cmd.ExecuteNonQueryAsync();
+                    }
+                }
+
+                // 🔹 Atualiza a ordem da story movida
+                const string updateSourceSql = @"UPDATE ""MOS"".""Stories"" SET ""Ordem"" = @ordem WHERE ""roId"" = @id";
+                await using (var cmd = new NpgsqlCommand(updateSourceSql, conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("ordem", ordemTarget);
+                    cmd.Parameters.AddWithValue("id", storyIdSource);
+                    await cmd.ExecuteNonQueryAsync();
+                }
+
+                //await tx.CommitAsync();
+
+                // Agora pega todos os stories afetados (no mesmo Rundown)
+                var selectSql = @"
+                    SELECT ""Id"", ""Ordem"", ""Titulo""
+                    FROM ""MOS"".""Stories"" 
+                    WHERE ""RundownId"" = (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @roId LIMIT 1)
+                    ORDER BY ""Ordem"";";
+
+                var stories = new List<object>();
+
+                await using (var cmd = new NpgsqlCommand(selectSql, conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("roId", roId);
+                    await using var reader = await cmd.ExecuteReaderAsync();
+                    while (await reader.ReadAsync())
+                    {
+                        stories.Add(new
+                        {
+                            Id = reader.GetInt32(0),
+                            Ordem = reader.GetInt32(1),
+                            Titulo = reader.GetString(2),
+                        });
+                    }
+                }
+
+                await tx.CommitAsync();
+
+                // Retorno JSON
+                var json = System.Text.Json.JsonSerializer.Serialize(
+                    new
+                    {
+                        command = "roElementMove",
+                        Programa = roId,
+                        Stories = stories
+                    });
+
+                return json;
+            }
+            catch (Exception ex)
+            {
+                await tx.RollbackAsync();
+                Console.WriteLine("Erro ao mover story: " + ex.Message);
+                throw;
+            }
+        }
+
+        public async Task<string> UpdateOrdemroElementAction__(XElement item)
+        {
             var roId = item.Element("roID")?.Value ?? "";
             var storyIdTarget = item.Element("element_target")?.Element("storyID")?.Value ?? "";
             var storyIdSource = item.Element("element_source")?.Element("storyID")?.Value ?? "";
@@ -947,7 +1094,8 @@ namespace JovemPan.Socket
                 SELECT s.""Id"", s.""roId"", s.""Identificador"", s.""Titulo"", s.""Ordem""
                 FROM ""MOS"".""Stories"" s
                 WHERE s.""roId"" = @roId
-                  AND s.""RundownId"" = (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1)
+                  AND s.""RundownId"" = (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1) 
+                ORDER BY s.""Id"" DESC 
                 LIMIT 1;";
                     await using var fetch = new NpgsqlCommand(fetchSql, conn, transaction);
                     fetch.Parameters.AddWithValue("roId", storyID);
@@ -1198,8 +1346,27 @@ namespace JovemPan.Socket
                 if (string.IsNullOrEmpty(roID) && !string.IsNullOrEmpty(storyID) && storyID.Contains(";"))
                     roID = storyID.Substring(0, storyID.LastIndexOf(';'));
 
-                const string deleteStoriesCreditoSql = @"DELETE FROM ""MOS"".""StoryCreditos"" 
-                                                 WHERE ""StoryId"" IN
+                // 🔹 1. Descobre ordem e RundownId da story que será removida
+                int ordemRemovida = 0;
+                int rundownDbId = 0;
+                const string getInfoSql = @"
+            SELECT s.""Ordem"", s.""RundownId""
+            FROM ""MOS"".""Stories"" s
+            WHERE s.""roId"" = @roId
+            LIMIT 1";
+                await using (var cmd = new NpgsqlCommand(getInfoSql, conn, transaction))
+                {
+                    cmd.Parameters.AddWithValue("roId", storyID);
+                    await using var reader = await cmd.ExecuteReaderAsync();
+                    if (await reader.ReadAsync())
+                    {
+                        ordemRemovida = reader.GetInt32(0);
+                        rundownDbId = reader.GetInt32(1);
+                    }
+                }
+
+                // 🔹 2. Deleta dependências (créditos / tarjas)
+                const string deleteStoriesCreditoSql = @"DELETE FROM ""MOS"".""StoryCreditos"" WHERE ""StoryId"" IN
                                                  (SELECT ""Id"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId LIMIT 1);";
                 await using (var cmd = new NpgsqlCommand(deleteStoriesCreditoSql, conn, transaction))
                 {
@@ -1207,8 +1374,7 @@ namespace JovemPan.Socket
                     await cmd.ExecuteNonQueryAsync();
                 }
 
-                const string deleteStoriesTarjaSql = @"DELETE FROM ""MOS"".""StoryTarjas"" 
-                                               WHERE ""StoryId"" IN
+                const string deleteStoriesTarjaSql = @"DELETE FROM ""MOS"".""StoryTarjas"" WHERE ""StoryId"" IN
                                                (SELECT ""Id"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId LIMIT 1);";
                 await using (var cmd = new NpgsqlCommand(deleteStoriesTarjaSql, conn, transaction))
                 {
@@ -1216,21 +1382,10 @@ namespace JovemPan.Socket
                     await cmd.ExecuteNonQueryAsync();
                 }
 
-                const string updateOrdemAllsql = @"UPDATE ""MOS"".""Stories"" 
-                                           SET ""Ordem"" = ""Ordem"" - 1 
-                                           WHERE ""Ordem"" >= (SELECT ""Ordem"" FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId)
-                                             AND ""RundownId"" = (SELECT ""Id"" FROM ""MOS"".""Rundowns"" WHERE ""Identificador"" = @RundownId LIMIT 1)";
-                await using (var cmd = new NpgsqlCommand(updateOrdemAllsql, conn, transaction))
-                {
-                    cmd.Parameters.AddWithValue("RundownId", roID);
-                    cmd.Parameters.AddWithValue("roId", storyID);
-                    await cmd.ExecuteNonQueryAsync();
-                }
-
+                // 🔹 3. Deleta a story e pega o Id interno
                 const string deleteStoriesSql = @"DELETE FROM ""MOS"".""Stories"" 
-                                  WHERE ""roId"" = @roId
-                                  RETURNING ""Id"";";
-
+                                          WHERE ""roId"" = @roId
+                                          RETURNING ""Id"";";
                 int? storyDbId = null;
                 await using (var cmd = new NpgsqlCommand(deleteStoriesSql, conn, transaction))
                 {
@@ -1238,6 +1393,19 @@ namespace JovemPan.Socket
                     var result = await cmd.ExecuteScalarAsync();
                     if (result != null && result != DBNull.Value)
                         storyDbId = Convert.ToInt32(result);
+                }
+
+                // 🔹 4. Reorganiza as ordens dos que estavam depois
+                const string updateOrdemAllsql = @"
+            UPDATE ""MOS"".""Stories"" 
+            SET ""Ordem"" = ""Ordem"" - 1
+            WHERE ""RundownId"" = @RundownId
+              AND ""Ordem"" > @ordemRemovida";
+                await using (var cmd = new NpgsqlCommand(updateOrdemAllsql, conn, transaction))
+                {
+                    cmd.Parameters.AddWithValue("RundownId", rundownDbId);
+                    cmd.Parameters.AddWithValue("ordemRemovida", ordemRemovida);
+                    await cmd.ExecuteNonQueryAsync();
                 }
 
                 await transaction.CommitAsync();
@@ -1253,27 +1421,6 @@ namespace JovemPan.Socket
                         status = "deleted"
                     }
                 });
-
-
-                //const string deleteStoriesSql = @"DELETE FROM ""MOS"".""Stories"" WHERE ""roId"" = @roId;";
-                //await using (var cmd = new NpgsqlCommand(deleteStoriesSql, conn, transaction))
-                //{
-                //    cmd.Parameters.AddWithValue("roId", storyID);
-                //    await cmd.ExecuteNonQueryAsync();
-                //}
-
-                //await transaction.CommitAsync();
-
-                //return System.Text.Json.JsonSerializer.Serialize(new
-                //{
-                //    command = "roDelete",
-                //    Programa = roID,
-                //    Story = new
-                //    {
-                //        StoryId = storyID,
-                //        status = "deleted"
-                //    }
-                //});
             }
             catch (Exception ex)
             {
